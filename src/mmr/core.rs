@@ -472,6 +472,7 @@ impl<S: Store> Mmr<S> {
                 leaves_count,
                 elements_count,
                 root_hash,
+                peaks_hashes: peaks,
             },
         })
     }

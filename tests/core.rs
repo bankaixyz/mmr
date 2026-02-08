@@ -7,8 +7,8 @@ mod common;
 
 use common::{hash_from_hex, hash_to_hex};
 use mmr::error::MmrError;
-use mmr::hasher::{Hasher, KeccakHasher};
-use mmr::types::ZERO_HASH;
+use mmr::hasher::{Hasher, KeccakHasher, PoseidonHasher};
+use mmr::types::{Hash32, ZERO_HASH};
 use mmr::{InMemoryStore, KeyKind, Mmr, Store, StoreError, StoreKey, StoreValue};
 #[cfg(feature = "postgres-store")]
 use mmr::{PostgresStore, PostgresStoreOptions};
@@ -24,6 +24,32 @@ fn lv(value: &str) -> mmr::Hash32 {
     let mut out = [0u8; 32];
     out[16..].copy_from_slice(&parsed.to_be_bytes());
     out
+}
+
+fn bag_from_peaks(hasher: &dyn Hasher, peaks_hashes: &[Hash32]) -> Hash32 {
+    match peaks_hashes.len() {
+        0 => ZERO_HASH,
+        1 => peaks_hashes[0],
+        _ => {
+            let mut acc = hasher
+                .hash_pair(
+                    &peaks_hashes[peaks_hashes.len() - 2],
+                    &peaks_hashes[peaks_hashes.len() - 1],
+                )
+                .unwrap();
+
+            for peak_hash in peaks_hashes[..peaks_hashes.len() - 2].iter().rev() {
+                acc = hasher.hash_pair(peak_hash, &acc).unwrap();
+            }
+
+            acc
+        }
+    }
+}
+
+fn root_from_peaks(hasher: &dyn Hasher, peaks_hashes: &[Hash32], elements_count: u64) -> Hash32 {
+    let bag = bag_from_peaks(hasher, peaks_hashes);
+    hasher.hash_count_and_bag(elements_count, &bag).unwrap()
 }
 
 #[cfg(feature = "postgres-store")]
@@ -89,7 +115,12 @@ async fn batch_append_matches_repeated_append_for_identical_values() {
         single_appends.push(single.append(lv(leaf)).await.unwrap());
     }
 
-    let mut batched = Mmr::new(Arc::new(InMemoryStore::default()), hasher, Some(102)).unwrap();
+    let mut batched = Mmr::new(
+        Arc::new(InMemoryStore::default()),
+        hasher.clone(),
+        Some(102),
+    )
+    .unwrap();
     let batch_values = leaves.iter().map(|leaf| lv(leaf)).collect::<Vec<_>>();
     let batch_result = batched.batch_append(&batch_values).await.unwrap();
 
@@ -113,6 +144,21 @@ async fn batch_append_matches_repeated_append_for_identical_values() {
     assert_eq!(
         batch_result.root_hash,
         single.get_root_hash().await.unwrap().unwrap()
+    );
+    assert_eq!(
+        batch_result.peaks_hashes,
+        batched
+            .get_peaks(Some(batch_result.elements_count))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        batch_result.root_hash,
+        root_from_peaks(
+            hasher.as_ref(),
+            &batch_result.peaks_hashes,
+            batch_result.elements_count,
+        )
     );
 
     assert_eq!(
@@ -154,7 +200,12 @@ async fn append_matches_batch_append_single_value() {
         Some(103),
     )
     .unwrap();
-    let mut batch_mmr = Mmr::new(Arc::new(InMemoryStore::default()), hasher, Some(104)).unwrap();
+    let mut batch_mmr = Mmr::new(
+        Arc::new(InMemoryStore::default()),
+        hasher.clone(),
+        Some(104),
+    )
+    .unwrap();
 
     for leaf in prefill {
         append_mmr.append(lv(leaf)).await.unwrap();
@@ -173,6 +224,47 @@ async fn append_matches_batch_append_single_value() {
     assert_eq!(batch_result.leaves_count, append_result.leaves_count);
     assert_eq!(batch_result.elements_count, append_result.elements_count);
     assert_eq!(batch_result.root_hash, append_result.root_hash);
+    assert_eq!(
+        batch_result.peaks_hashes,
+        batch_mmr
+            .get_peaks(Some(batch_result.elements_count))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        batch_result.root_hash,
+        root_from_peaks(
+            hasher.as_ref(),
+            &batch_result.peaks_hashes,
+            batch_result.elements_count,
+        )
+    );
+}
+
+#[tokio::test]
+async fn batch_append_result_peaks_and_root_are_consistent_for_poseidon() {
+    let hasher = Arc::new(PoseidonHasher::new());
+    let mut mmr = Mmr::new(
+        Arc::new(InMemoryStore::default()),
+        hasher.clone(),
+        Some(106),
+    )
+    .unwrap();
+
+    let result = mmr
+        .batch_append(&[lv("1"), lv("2"), lv("3"), lv("4"), lv("5")])
+        .await
+        .unwrap();
+
+    assert!(!result.peaks_hashes.is_empty());
+    assert_eq!(
+        result.peaks_hashes,
+        mmr.get_peaks(Some(result.elements_count)).await.unwrap()
+    );
+    assert_eq!(
+        result.root_hash,
+        root_from_peaks(hasher.as_ref(), &result.peaks_hashes, result.elements_count)
+    );
 }
 
 #[tokio::test]
@@ -624,12 +716,8 @@ async fn postgres_batch_append_in_tx_rollback_leaves_store_unchanged() {
         .await
         .unwrap(),
     );
-    let mut mmr = Mmr::new(
-        store.clone(),
-        Arc::new(KeccakHasher::new()),
-        Some(unique_test_mmr_id()),
-    )
-    .unwrap();
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store.clone(), hasher.clone(), Some(unique_test_mmr_id())).unwrap();
 
     let mut tx = store.begin_write_tx().await.unwrap();
     let result = mmr
@@ -637,11 +725,60 @@ async fn postgres_batch_append_in_tx_rollback_leaves_store_unchanged() {
         .await
         .unwrap();
     assert_eq!(result.appended_count, 3);
+    assert!(!result.peaks_hashes.is_empty());
+    assert_eq!(
+        result.root_hash,
+        root_from_peaks(hasher.as_ref(), &result.peaks_hashes, result.elements_count)
+    );
     tx.rollback().await.unwrap();
 
     assert_eq!(mmr.get_elements_count().await.unwrap(), 0);
     assert_eq!(mmr.get_leaves_count().await.unwrap(), 0);
     assert!(mmr.get_root_hash().await.unwrap().is_none());
+}
+
+#[cfg(feature = "postgres-store")]
+#[tokio::test]
+async fn postgres_batch_append_in_tx_returns_peaks_matching_committed_state() {
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => return,
+    };
+
+    let store = Arc::new(
+        PostgresStore::connect_with_options(
+            &database_url,
+            PostgresStoreOptions {
+                initialize_schema: true,
+                max_connections: 2,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store.clone(), hasher.clone(), Some(unique_test_mmr_id())).unwrap();
+
+    let mut tx = store.begin_write_tx().await.unwrap();
+    let result = mmr
+        .batch_append_in_tx(&mut tx, &[lv("1"), lv("2"), lv("3")])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert!(!result.peaks_hashes.is_empty());
+    assert_eq!(
+        result.root_hash,
+        root_from_peaks(hasher.as_ref(), &result.peaks_hashes, result.elements_count)
+    );
+    assert_eq!(
+        result.peaks_hashes,
+        mmr.get_peaks(Some(result.elements_count)).await.unwrap()
+    );
+    assert_eq!(
+        result.root_hash,
+        mmr.get_root_hash().await.unwrap().unwrap()
+    );
 }
 
 #[cfg(feature = "postgres-store")]
@@ -699,12 +836,8 @@ async fn postgres_multiple_appends_in_same_tx_are_composable() {
         .await
         .unwrap(),
     );
-    let mut mmr = Mmr::new(
-        store.clone(),
-        Arc::new(KeccakHasher::new()),
-        Some(unique_test_mmr_id()),
-    )
-    .unwrap();
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store.clone(), hasher.clone(), Some(unique_test_mmr_id())).unwrap();
 
     let mut tx = store.begin_write_tx().await.unwrap();
     let first = mmr.append_in_tx(&mut tx, lv("21")).await.unwrap();
@@ -715,4 +848,34 @@ async fn postgres_multiple_appends_in_same_tx_are_composable() {
     assert_eq!(second.elements_count, 3);
     assert_eq!(mmr.get_elements_count().await.unwrap(), 3);
     assert_eq!(mmr.get_leaves_count().await.unwrap(), 2);
+
+    let mut tx = store.begin_write_tx().await.unwrap();
+    let first_batch = mmr.batch_append_in_tx(&mut tx, &[lv("31")]).await.unwrap();
+    let second_batch = mmr.batch_append_in_tx(&mut tx, &[lv("32")]).await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert!(!first_batch.peaks_hashes.is_empty());
+    assert_eq!(
+        first_batch.root_hash,
+        root_from_peaks(
+            hasher.as_ref(),
+            &first_batch.peaks_hashes,
+            first_batch.elements_count,
+        )
+    );
+    assert!(!second_batch.peaks_hashes.is_empty());
+    assert_eq!(
+        second_batch.root_hash,
+        root_from_peaks(
+            hasher.as_ref(),
+            &second_batch.peaks_hashes,
+            second_batch.elements_count,
+        )
+    );
+    assert_eq!(
+        second_batch.peaks_hashes,
+        mmr.get_peaks(Some(second_batch.elements_count))
+            .await
+            .unwrap()
+    );
 }

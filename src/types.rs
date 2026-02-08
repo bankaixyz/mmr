@@ -31,4 +31,5 @@ pub struct BatchAppendResult {
     pub leaves_count: LeavesCount,
     pub elements_count: ElementsCount,
     pub root_hash: Hash32,
+    pub peaks_hashes: Vec<Hash32>,
 }
