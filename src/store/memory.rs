@@ -17,7 +17,7 @@ impl InMemoryStore {
 }
 
 impl Store for InMemoryStore {
-    fn get(&self, key: &StoreKey) -> Result<Option<StoreValue>, StoreError> {
+    async fn get(&self, key: &StoreKey) -> Result<Option<StoreValue>, StoreError> {
         let guard = self
             .inner
             .read()
@@ -25,7 +25,7 @@ impl Store for InMemoryStore {
         Ok(guard.get(key).cloned())
     }
 
-    fn set(&self, key: StoreKey, value: StoreValue) -> Result<(), StoreError> {
+    async fn set(&self, key: StoreKey, value: StoreValue) -> Result<(), StoreError> {
         let mut guard = self
             .inner
             .write()
@@ -34,7 +34,7 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    fn set_many(&self, entries: Vec<(StoreKey, StoreValue)>) -> Result<(), StoreError> {
+    async fn set_many(&self, entries: Vec<(StoreKey, StoreValue)>) -> Result<(), StoreError> {
         let mut guard = self
             .inner
             .write()
@@ -47,7 +47,7 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError> {
+    async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError> {
         let guard = self
             .inner
             .read()
@@ -61,8 +61,8 @@ mod tests {
     use super::{InMemoryStore, Store, StoreKey, StoreValue};
     use crate::store::KeyKind;
 
-    #[test]
-    fn set_many_writes_all_entries() {
+    #[tokio::test]
+    async fn set_many_writes_all_entries() {
         let store = InMemoryStore::new();
         let entries = vec![
             (
@@ -75,14 +75,16 @@ mod tests {
             ),
         ];
 
-        store.set_many(entries).unwrap();
+        store.set_many(entries).await.unwrap();
 
         let leaf = store
             .get(&StoreKey::metadata(1, KeyKind::LeafCount))
+            .await
             .unwrap()
             .unwrap();
         let node = store
             .get(&StoreKey::new(1, KeyKind::NodeHash, 10))
+            .await
             .unwrap()
             .unwrap();
 

@@ -3,6 +3,8 @@ mod memory;
 #[cfg(feature = "postgres-store")]
 mod postgres;
 
+use std::sync::Arc;
+
 use crate::error::StoreError;
 
 pub use key::{KeyKind, StoreKey, StoreValue};
@@ -10,17 +12,36 @@ pub use memory::InMemoryStore;
 #[cfg(feature = "postgres-store")]
 pub use postgres::{PostgresStore, PostgresStoreOptions};
 
+#[allow(async_fn_in_trait)]
 pub trait Store: Send + Sync {
-    fn get(&self, key: &StoreKey) -> Result<Option<StoreValue>, StoreError>;
-    fn set(&self, key: StoreKey, value: StoreValue) -> Result<(), StoreError>;
-    fn set_many(&self, entries: Vec<(StoreKey, StoreValue)>) -> Result<(), StoreError> {
+    async fn get(&self, key: &StoreKey) -> Result<Option<StoreValue>, StoreError>;
+    async fn set(&self, key: StoreKey, value: StoreValue) -> Result<(), StoreError>;
+    async fn set_many(&self, entries: Vec<(StoreKey, StoreValue)>) -> Result<(), StoreError> {
         for (key, value) in entries {
-            self.set(key, value)?;
+            self.set(key, value).await?;
         }
 
         Ok(())
     }
-    fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError>;
+    async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError>;
+}
+
+impl<T: Store + ?Sized> Store for Arc<T> {
+    async fn get(&self, key: &StoreKey) -> Result<Option<StoreValue>, StoreError> {
+        (**self).get(key).await
+    }
+
+    async fn set(&self, key: StoreKey, value: StoreValue) -> Result<(), StoreError> {
+        (**self).set(key, value).await
+    }
+
+    async fn set_many(&self, entries: Vec<(StoreKey, StoreValue)>) -> Result<(), StoreError> {
+        (**self).set_many(entries).await
+    }
+
+    async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError> {
+        (**self).get_many(keys).await
+    }
 }
 
 impl StoreValue {

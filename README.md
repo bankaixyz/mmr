@@ -1,6 +1,6 @@
 # mmr
 
-`mmr` is a minimal, synchronous Merkle Mountain Range (MMR) library with typed hashes, pluggable storage, and Keccak/Poseidon hashing.
+`mmr` is a minimal, async Merkle Mountain Range (MMR) library with typed hashes, pluggable storage, and Keccak/Poseidon hashing.
 
 ## Functionality
 
@@ -26,16 +26,17 @@
 use std::sync::Arc;
 use mmr::{InMemoryStore, KeccakHasher, Mmr};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(InMemoryStore::default());
     let hasher = Arc::new(KeccakHasher::new());
     let mut mmr = Mmr::new(store, hasher, Some(1))?;
 
     let leaf = [1u8; 32];
-    let append = mmr.append(leaf)?;
+    let append = mmr.append(leaf).await?;
 
-    let proof = mmr.get_proof(append.element_index, None)?;
-    assert!(mmr.verify_proof(&proof, leaf, None)?);
+    let proof = mmr.get_proof(append.element_index, None).await?;
+    assert!(mmr.verify_proof(&proof, leaf, None).await?);
 
     Ok(())
 }

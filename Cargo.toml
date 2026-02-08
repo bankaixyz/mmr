@@ -2,12 +2,12 @@
 name = "mmr"
 version = "0.1.0"
 edition = "2024"
-description = "Minimal synchronous MMR core with typed storage and Keccak/Poseidon hashers"
+description = "Minimal async MMR core with typed storage and Keccak/Poseidon hashers"
 
 [features]
 default = []
 stateless-verify = []
-postgres-store = ["dep:sqlx", "dep:tokio"]
+postgres-store = ["dep:sqlx"]
 
 [dependencies]
 thiserror = "1.0"
@@ -16,8 +16,7 @@ hex = "0.4"
 starknet = "0.6.0"
 starknet-crypto = "0.6.0"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 rand = "0.8"

@@ -1,8 +1,5 @@
-use std::future::Future;
-use std::sync::{Mutex, MutexGuard};
-
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::postgres::{PgPoolOptions, PgRow};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::error::StoreError;
 
@@ -27,7 +24,6 @@ impl Default for PostgresStoreOptions {
 }
 
 pub struct PostgresStore {
-    runtime: Mutex<tokio::runtime::Runtime>,
     pool: PgPool,
     table_name: String,
 }
@@ -41,61 +37,86 @@ impl std::fmt::Debug for PostgresStore {
 }
 
 impl PostgresStore {
-    pub fn connect(connection_string: &str) -> Result<Self, StoreError> {
-        Self::connect_with_options(connection_string, PostgresStoreOptions::default())
+    pub async fn connect(connection_string: &str) -> Result<Self, StoreError> {
+        Self::connect_with_options(connection_string, PostgresStoreOptions::default()).await
     }
 
-    pub fn connect_with_options(
+    pub async fn connect_with_options(
         connection_string: &str,
         options: PostgresStoreOptions,
     ) -> Result<Self, StoreError> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| StoreError::Internal(format!("failed to build tokio runtime: {err}")))?;
-
-        let pool = runtime.block_on(async {
-            PgPoolOptions::new()
-                .max_connections(options.max_connections)
-                .connect(connection_string)
-                .await
-        })?;
+        let pool = PgPoolOptions::new()
+            .max_connections(options.max_connections)
+            .connect(connection_string)
+            .await?;
 
         let store = Self {
-            runtime: Mutex::new(runtime),
             pool,
             table_name: DEFAULT_TABLE_NAME.to_string(),
         };
 
         if options.initialize_schema {
-            store.init_schema()?;
+            store.init_schema().await?;
         }
 
         Ok(store)
     }
 
-    pub fn init_schema(&self) -> Result<(), StoreError> {
-        self.block_on(async {
-            sqlx::query(&self.create_table_sql())
-                .execute(&self.pool)
-                .await
-        })?;
+    pub async fn init_schema(&self) -> Result<(), StoreError> {
+        sqlx::query(&self.create_table_sql())
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
 
-    fn block_on<T, F>(&self, future: F) -> Result<T, StoreError>
-    where
-        F: Future<Output = Result<T, sqlx::Error>>,
-    {
-        let runtime = self.lock_runtime()?;
-        runtime.block_on(future).map_err(StoreError::from)
+    pub async fn begin_write_tx(&self) -> Result<Transaction<'_, Postgres>, StoreError> {
+        self.pool.begin().await.map_err(StoreError::from)
     }
 
-    fn lock_runtime(&self) -> Result<MutexGuard<'_, tokio::runtime::Runtime>, StoreError> {
-        self.runtime
-            .lock()
-            .map_err(|_| StoreError::Internal("tokio runtime mutex poisoned".to_string()))
+    pub(crate) async fn set_many_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        entries: Vec<(StoreKey, StoreValue)>,
+    ) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let (mmr_ids, kinds, indices, values) = prepare_entries(entries)?;
+        let query = self.set_many_query();
+
+        sqlx::query(&query)
+            .bind(&mmr_ids)
+            .bind(&kinds)
+            .bind(&indices)
+            .bind(&values)
+            .execute(&mut **tx)
+            .await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn get_many_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        keys: &[StoreKey],
+    ) -> Result<Vec<Option<StoreValue>>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (mmr_ids, kinds, indices) = prepare_keys(keys)?;
+        let query = self.get_many_query();
+
+        let rows = sqlx::query(&query)
+            .bind(&mmr_ids)
+            .bind(&kinds)
+            .bind(&indices)
+            .fetch_all(&mut **tx)
+            .await?;
+
+        decode_many_values(keys, rows)
     }
 
     fn create_table_sql(&self) -> String {
@@ -116,80 +137,25 @@ impl PostgresStore {
             table = self.table_name
         )
     }
-}
 
-impl Store for PostgresStore {
-    fn get(&self, key: &StoreKey) -> Result<Option<StoreValue>, StoreError> {
-        let mmr_id = to_pg_mmr_id(key.mmr_id)?;
-        let kind = kind_to_i16(key.kind);
-        let idx = to_pg_idx(key.index)?;
-        let query = format!(
+    fn get_query(&self) -> String {
+        format!(
             "SELECT value FROM {} WHERE mmr_id = $1 AND kind = $2 AND idx = $3",
             self.table_name
-        );
-
-        let row = self.block_on(async {
-            sqlx::query(&query)
-                .bind(mmr_id)
-                .bind(kind)
-                .bind(idx)
-                .fetch_optional(&self.pool)
-                .await
-        })?;
-
-        match row {
-            Some(row) => {
-                let value: Vec<u8> = row.try_get("value")?;
-                decode_store_value(key, &value).map(Some)
-            }
-            None => Ok(None),
-        }
+        )
     }
 
-    fn set(&self, key: StoreKey, value: StoreValue) -> Result<(), StoreError> {
-        let mmr_id = to_pg_mmr_id(key.mmr_id)?;
-        let kind = kind_to_i16(key.kind);
-        let idx = to_pg_idx(key.index)?;
-        let query = format!(
+    fn set_query(&self) -> String {
+        format!(
             "INSERT INTO {} (mmr_id, kind, idx, value)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (mmr_id, kind, idx) DO UPDATE SET value = EXCLUDED.value",
             self.table_name
-        );
-
-        let encoded = encode_store_value(&key, &value)?;
-
-        self.block_on(async {
-            sqlx::query(&query)
-                .bind(mmr_id)
-                .bind(kind)
-                .bind(idx)
-                .bind(encoded)
-                .execute(&self.pool)
-                .await
-        })?;
-
-        Ok(())
+        )
     }
 
-    fn set_many(&self, entries: Vec<(StoreKey, StoreValue)>) -> Result<(), StoreError> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        let mut mmr_ids = Vec::with_capacity(entries.len());
-        let mut kinds = Vec::with_capacity(entries.len());
-        let mut indices = Vec::with_capacity(entries.len());
-        let mut values = Vec::with_capacity(entries.len());
-
-        for (key, value) in entries {
-            mmr_ids.push(to_pg_mmr_id(key.mmr_id)?);
-            kinds.push(kind_to_i16(key.kind));
-            indices.push(to_pg_idx(key.index)?);
-            values.push(encode_store_value(&key, &value)?);
-        }
-
-        let query = format!(
+    fn set_many_query(&self) -> String {
+        format!(
             "WITH input AS (
                 SELECT *
                 FROM unnest($1::int4[], $2::int2[], $3::int8[], $4::bytea[])
@@ -199,37 +165,11 @@ impl Store for PostgresStore {
             SELECT mmr_id, kind, idx, value FROM input
             ON CONFLICT (mmr_id, kind, idx) DO UPDATE SET value = EXCLUDED.value",
             table = self.table_name
-        );
-
-        self.block_on(async {
-            sqlx::query(&query)
-                .bind(&mmr_ids)
-                .bind(&kinds)
-                .bind(&indices)
-                .bind(&values)
-                .execute(&self.pool)
-                .await
-        })?;
-
-        Ok(())
+        )
     }
 
-    fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut mmr_ids = Vec::with_capacity(keys.len());
-        let mut kinds = Vec::with_capacity(keys.len());
-        let mut indices = Vec::with_capacity(keys.len());
-
-        for key in keys {
-            mmr_ids.push(to_pg_mmr_id(key.mmr_id)?);
-            kinds.push(kind_to_i16(key.kind));
-            indices.push(to_pg_idx(key.index)?);
-        }
-
-        let query = format!(
+    fn get_many_query(&self) -> String {
+        format!(
             "WITH requested AS (
                 SELECT *
                 FROM unnest($1::int4[], $2::int2[], $3::int8[])
@@ -243,31 +183,138 @@ impl Store for PostgresStore {
                AND store.idx = req.idx
             ORDER BY req.ord",
             table = self.table_name
-        );
+        )
+    }
+}
 
-        let rows = self.block_on(async {
-            sqlx::query(&query)
-                .bind(&mmr_ids)
-                .bind(&kinds)
-                .bind(&indices)
-                .fetch_all(&self.pool)
-                .await
-        })?;
+impl Store for PostgresStore {
+    async fn get(&self, key: &StoreKey) -> Result<Option<StoreValue>, StoreError> {
+        let mmr_id = to_pg_mmr_id(key.mmr_id)?;
+        let kind = kind_to_i16(key.kind);
+        let idx = to_pg_idx(key.index)?;
+        let query = self.get_query();
 
-        let mut out = vec![None; keys.len()];
-        for row in rows {
-            let ord: i64 = row.try_get("ord")?;
-            let position = usize::try_from(ord - 1).map_err(|_| {
-                StoreError::Internal(format!("invalid ordinality returned by postgres: {ord}"))
-            })?;
-            let maybe_value: Option<Vec<u8>> = row.try_get("value")?;
-            if let Some(value) = maybe_value {
-                out[position] = Some(decode_store_value(&keys[position], &value)?);
+        let row = sqlx::query(&query)
+            .bind(mmr_id)
+            .bind(kind)
+            .bind(idx)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some(row) => {
+                let value: Vec<u8> = row.try_get("value")?;
+                decode_store_value(key, &value).map(Some)
             }
+            None => Ok(None),
+        }
+    }
+
+    async fn set(&self, key: StoreKey, value: StoreValue) -> Result<(), StoreError> {
+        let mmr_id = to_pg_mmr_id(key.mmr_id)?;
+        let kind = kind_to_i16(key.kind);
+        let idx = to_pg_idx(key.index)?;
+        let query = self.set_query();
+        let encoded = encode_store_value(&key, &value)?;
+
+        sqlx::query(&query)
+            .bind(mmr_id)
+            .bind(kind)
+            .bind(idx)
+            .bind(encoded)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn set_many(&self, entries: Vec<(StoreKey, StoreValue)>) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
         }
 
-        Ok(out)
+        let (mmr_ids, kinds, indices, values) = prepare_entries(entries)?;
+        let query = self.set_many_query();
+
+        sqlx::query(&query)
+            .bind(&mmr_ids)
+            .bind(&kinds)
+            .bind(&indices)
+            .bind(&values)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
     }
+
+    async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (mmr_ids, kinds, indices) = prepare_keys(keys)?;
+        let query = self.get_many_query();
+
+        let rows = sqlx::query(&query)
+            .bind(&mmr_ids)
+            .bind(&kinds)
+            .bind(&indices)
+            .fetch_all(&self.pool)
+            .await?;
+
+        decode_many_values(keys, rows)
+    }
+}
+
+fn prepare_entries(
+    entries: Vec<(StoreKey, StoreValue)>,
+) -> Result<(Vec<i32>, Vec<i16>, Vec<i64>, Vec<Vec<u8>>), StoreError> {
+    let mut mmr_ids = Vec::with_capacity(entries.len());
+    let mut kinds = Vec::with_capacity(entries.len());
+    let mut indices = Vec::with_capacity(entries.len());
+    let mut values = Vec::with_capacity(entries.len());
+
+    for (key, value) in entries {
+        mmr_ids.push(to_pg_mmr_id(key.mmr_id)?);
+        kinds.push(kind_to_i16(key.kind));
+        indices.push(to_pg_idx(key.index)?);
+        values.push(encode_store_value(&key, &value)?);
+    }
+
+    Ok((mmr_ids, kinds, indices, values))
+}
+
+fn prepare_keys(keys: &[StoreKey]) -> Result<(Vec<i32>, Vec<i16>, Vec<i64>), StoreError> {
+    let mut mmr_ids = Vec::with_capacity(keys.len());
+    let mut kinds = Vec::with_capacity(keys.len());
+    let mut indices = Vec::with_capacity(keys.len());
+
+    for key in keys {
+        mmr_ids.push(to_pg_mmr_id(key.mmr_id)?);
+        kinds.push(kind_to_i16(key.kind));
+        indices.push(to_pg_idx(key.index)?);
+    }
+
+    Ok((mmr_ids, kinds, indices))
+}
+
+fn decode_many_values(
+    keys: &[StoreKey],
+    rows: Vec<PgRow>,
+) -> Result<Vec<Option<StoreValue>>, StoreError> {
+    let mut out = vec![None; keys.len()];
+    for row in rows {
+        let ord: i64 = row.try_get("ord")?;
+        let position = usize::try_from(ord - 1).map_err(|_| {
+            StoreError::Internal(format!("invalid ordinality returned by postgres: {ord}"))
+        })?;
+        let maybe_value: Option<Vec<u8>> = row.try_get("value")?;
+        if let Some(value) = maybe_value {
+            out[position] = Some(decode_store_value(&keys[position], &value)?);
+        }
+    }
+
+    Ok(out)
 }
 
 fn kind_to_i16(kind: KeyKind) -> i16 {
@@ -360,8 +407,8 @@ mod tests {
         assert_eq!(encoded.len(), 8);
     }
 
-    #[test]
-    fn set_many_roundtrip_works_when_database_url_is_available() {
+    #[tokio::test]
+    async fn set_many_roundtrip_works_when_database_url_is_available() {
         let database_url = match std::env::var("DATABASE_URL") {
             Ok(url) => url,
             Err(_) => return,
@@ -374,6 +421,7 @@ mod tests {
                 max_connections: 2,
             },
         )
+        .await
         .unwrap();
 
         let nonce = SystemTime::now()
@@ -393,9 +441,10 @@ mod tests {
                 (keys[0].clone(), StoreValue::U64(12)),
                 (keys[1].clone(), StoreValue::Hash([7u8; 32])),
             ])
+            .await
             .unwrap();
 
-        let values = store.get_many(&keys).unwrap();
+        let values = store.get_many(&keys).await.unwrap();
         assert_eq!(
             values[0]
                 .clone()
@@ -412,5 +461,25 @@ mod tests {
                 .unwrap(),
             [7u8; 32]
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_store_in_async_context_does_not_panic() {
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => return,
+        };
+
+        let store = PostgresStore::connect_with_options(
+            &database_url,
+            PostgresStoreOptions {
+                initialize_schema: true,
+                max_connections: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        drop(store);
     }
 }
