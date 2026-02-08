@@ -1,5 +1,8 @@
+mod common;
+
+use common::{hash_from_hex, hash_to_hex};
 use mmr::hasher::{Hasher, KeccakHasher};
-use mmr::types::{Hash32, hash_from_hex, hash_to_hex};
+use mmr::types::Hash32;
 
 #[test]
 fn should_compute_a_hash_pair() {

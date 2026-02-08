@@ -1,6 +1,9 @@
+mod common;
+
+use common::{hash_from_hex, hash_to_hex};
 use mmr::error::HasherError;
 use mmr::hasher::{Hasher, PoseidonHasher};
-use mmr::types::{Hash32, hash_from_hex, hash_to_hex};
+use mmr::types::Hash32;
 
 fn assert_matches_hex(actual: Hash32, expected_hex: &str) {
     let expected = hash_from_hex(expected_hex).unwrap();

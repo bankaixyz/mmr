@@ -3,16 +3,19 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+mod common;
+
+use common::{hash_from_hex, hash_to_hex};
 use mmr::error::MmrError;
 use mmr::hasher::{Hasher, KeccakHasher};
-use mmr::types::{ZERO_HASH, hash_to_hex};
+use mmr::types::ZERO_HASH;
 use mmr::{InMemoryStore, KeyKind, Mmr, Store, StoreError, StoreKey, StoreValue};
 
 const LEAVES: [&str; 5] = ["1", "2", "3", "4", "5"];
 
 fn lv(value: &str) -> mmr::Hash32 {
     if value.starts_with("0x") || value.starts_with("0X") {
-        return mmr::types::hash_from_hex(value).unwrap();
+        return hash_from_hex(value).unwrap();
     }
 
     let parsed = value.parse::<u128>().unwrap();
