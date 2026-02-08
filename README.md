@@ -45,3 +45,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - `postgres-store`: enables PostgreSQL-backed storage.
 - `stateless-verify`: enables `verify_proof_stateless`.
+
+## Running Tests
+
+```bash
+cargo test
+```
+
+## Acknowledgements
+
+Thanks to Herodotus for their work on MMRs and open-source reference implementations:
+[HerodotusDev/rust-accumulators](https://github.com/HerodotusDev/rust-accumulators).
