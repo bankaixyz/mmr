@@ -6,11 +6,18 @@ mod postgres;
 use std::sync::Arc;
 
 use crate::error::StoreError;
+use crate::types::{BatchAppendResult, MmrId};
 
 pub use key::{KeyKind, StoreKey, StoreValue};
 pub use memory::InMemoryStore;
 #[cfg(feature = "postgres-store")]
 pub use postgres::{PostgresStore, PostgresStoreOptions};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBatch {
+    pub staged_writes: Vec<(StoreKey, StoreValue)>,
+    pub result: BatchAppendResult,
+}
 
 #[allow(async_fn_in_trait)]
 pub trait Store: Send + Sync {
@@ -24,6 +31,28 @@ pub trait Store: Send + Sync {
         Ok(())
     }
     async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError>;
+    async fn create_pending_batch(
+        &self,
+        _mmr_id: MmrId,
+        _batch: PendingBatch,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Internal(
+            "pending batches are not supported by this store backend".to_string(),
+        ))
+    }
+    async fn get_pending_batch(&self, _mmr_id: MmrId) -> Result<Option<PendingBatch>, StoreError> {
+        Err(StoreError::Internal(
+            "pending batches are not supported by this store backend".to_string(),
+        ))
+    }
+    async fn delete_pending_batch(&self, _mmr_id: MmrId) -> Result<(), StoreError> {
+        Err(StoreError::Internal(
+            "pending batches are not supported by this store backend".to_string(),
+        ))
+    }
+    async fn has_pending_batch(&self, _mmr_id: MmrId) -> Result<bool, StoreError> {
+        Ok(false)
+    }
 }
 
 impl<T: Store + ?Sized> Store for Arc<T> {
@@ -41,6 +70,26 @@ impl<T: Store + ?Sized> Store for Arc<T> {
 
     async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError> {
         (**self).get_many(keys).await
+    }
+
+    async fn create_pending_batch(
+        &self,
+        mmr_id: MmrId,
+        batch: PendingBatch,
+    ) -> Result<(), StoreError> {
+        (**self).create_pending_batch(mmr_id, batch).await
+    }
+
+    async fn get_pending_batch(&self, mmr_id: MmrId) -> Result<Option<PendingBatch>, StoreError> {
+        (**self).get_pending_batch(mmr_id).await
+    }
+
+    async fn delete_pending_batch(&self, mmr_id: MmrId) -> Result<(), StoreError> {
+        (**self).delete_pending_batch(mmr_id).await
+    }
+
+    async fn has_pending_batch(&self, mmr_id: MmrId) -> Result<bool, StoreError> {
+        (**self).has_pending_batch(mmr_id).await
     }
 }
 

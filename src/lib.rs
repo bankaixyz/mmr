@@ -11,7 +11,7 @@ pub use mmr::{
     get_peak_info, leaf_count_to_append_no_merges, leaf_count_to_mmr_size,
     leaf_count_to_peaks_count, map_leaf_index_to_element_index, mmr_size_to_leaf_count,
 };
-pub use store::{InMemoryStore, KeyKind, Store, StoreKey, StoreValue};
+pub use store::{InMemoryStore, KeyKind, PendingBatch, Store, StoreKey, StoreValue};
 #[cfg(feature = "postgres-store")]
 pub use store::{PostgresStore, PostgresStoreOptions};
 pub use types::{AppendResult, BatchAppendResult, Hash32, MmrId, Proof};

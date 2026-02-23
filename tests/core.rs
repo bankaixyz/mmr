@@ -280,6 +280,172 @@ async fn batch_append_rejects_empty_values() {
 }
 
 #[tokio::test]
+async fn precommit_rejects_second_pending_batch() {
+    let store = Arc::new(InMemoryStore::default());
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store, hasher, Some(107)).unwrap();
+
+    mmr.batch_precommit_append(&[lv("1"), lv("2")]).await.unwrap();
+    assert!(matches!(
+        mmr.batch_precommit_append(&[lv("3")]).await,
+        Err(MmrError::PrecommitAlreadyPending)
+    ));
+}
+
+#[tokio::test]
+async fn append_and_batch_append_are_blocked_while_precommit_is_pending() {
+    let store = Arc::new(InMemoryStore::default());
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store, hasher, Some(108)).unwrap();
+
+    mmr.append(lv("1")).await.unwrap();
+    mmr.batch_precommit_append(&[lv("2"), lv("3")]).await.unwrap();
+
+    assert!(matches!(
+        mmr.append(lv("4")).await,
+        Err(MmrError::AppendBlockedByPendingPrecommit)
+    ));
+    assert!(matches!(
+        mmr.batch_append(&[lv("5"), lv("6")]).await,
+        Err(MmrError::AppendBlockedByPendingPrecommit)
+    ));
+}
+
+#[tokio::test]
+async fn precommit_does_not_change_committed_state_until_commit() {
+    let store = Arc::new(InMemoryStore::default());
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store, hasher, Some(109)).unwrap();
+
+    for leaf in ["1", "2", "3", "4", "5"] {
+        mmr.append(lv(leaf)).await.unwrap();
+    }
+
+    let committed_elements = mmr.get_elements_count().await.unwrap();
+    let committed_leaves = mmr.get_leaves_count().await.unwrap();
+    let committed_root = mmr.get_root_hash().await.unwrap().unwrap();
+    let committed_peaks = mmr.get_peaks(None).await.unwrap();
+
+    let precommit_result = mmr
+        .batch_precommit_append(&[lv("6"), lv("7"), lv("8")])
+        .await
+        .unwrap();
+    assert_eq!(precommit_result.appended_count, 3);
+
+    assert_eq!(mmr.get_elements_count().await.unwrap(), committed_elements);
+    assert_eq!(mmr.get_leaves_count().await.unwrap(), committed_leaves);
+    assert_eq!(mmr.get_root_hash().await.unwrap().unwrap(), committed_root);
+    assert_eq!(mmr.get_peaks(None).await.unwrap(), committed_peaks);
+}
+
+#[tokio::test]
+async fn commit_precommit_returns_batch_result_and_promotes_state() {
+    let store = Arc::new(InMemoryStore::default());
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store, hasher, Some(110)).unwrap();
+
+    for leaf in ["1", "2", "3", "4", "5"] {
+        mmr.append(lv(leaf)).await.unwrap();
+    }
+
+    let precommit_result = mmr
+        .batch_precommit_append(&[lv("6"), lv("7"), lv("8")])
+        .await
+        .unwrap();
+    let commit_result = mmr.commit_precommit().await.unwrap();
+
+    assert_eq!(commit_result, precommit_result);
+    assert_eq!(mmr.get_elements_count().await.unwrap(), commit_result.elements_count);
+    assert_eq!(mmr.get_leaves_count().await.unwrap(), commit_result.leaves_count);
+    assert_eq!(
+        mmr.get_root_hash().await.unwrap().unwrap(),
+        commit_result.root_hash
+    );
+    assert_eq!(mmr.get_peaks(None).await.unwrap(), commit_result.peaks_hashes);
+    assert!(matches!(
+        mmr.commit_precommit().await,
+        Err(MmrError::NoPendingPrecommit)
+    ));
+}
+
+#[tokio::test]
+async fn revert_precommit_discards_staged_state_and_preserves_committed_state() {
+    let store = Arc::new(InMemoryStore::default());
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store, hasher, Some(111)).unwrap();
+
+    for leaf in ["1", "2", "3", "4", "5"] {
+        mmr.append(lv(leaf)).await.unwrap();
+    }
+
+    let committed_elements = mmr.get_elements_count().await.unwrap();
+    let committed_leaves = mmr.get_leaves_count().await.unwrap();
+    let committed_root = mmr.get_root_hash().await.unwrap().unwrap();
+    let committed_peaks = mmr.get_peaks(None).await.unwrap();
+
+    mmr.batch_precommit_append(&[lv("6"), lv("7"), lv("8")])
+        .await
+        .unwrap();
+    mmr.revert_precommit().await.unwrap();
+
+    assert_eq!(mmr.get_elements_count().await.unwrap(), committed_elements);
+    assert_eq!(mmr.get_leaves_count().await.unwrap(), committed_leaves);
+    assert_eq!(mmr.get_root_hash().await.unwrap().unwrap(), committed_root);
+    assert_eq!(mmr.get_peaks(None).await.unwrap(), committed_peaks);
+    assert!(matches!(
+        mmr.revert_precommit().await,
+        Err(MmrError::NoPendingPrecommit)
+    ));
+}
+
+#[tokio::test]
+async fn precommit_matches_batch_append_output_exactly_from_same_base_state() {
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut normal = Mmr::new(
+        Arc::new(InMemoryStore::default()),
+        hasher.clone(),
+        Some(112),
+    )
+    .unwrap();
+    let mut precommit = Mmr::new(Arc::new(InMemoryStore::default()), hasher, Some(113)).unwrap();
+
+    for leaf in ["1", "2", "3", "4", "5", "6", "7"] {
+        normal.append(lv(leaf)).await.unwrap();
+        precommit.append(lv(leaf)).await.unwrap();
+    }
+
+    let values = [lv("8"), lv("9"), lv("10"), lv("11")];
+    let normal_result = normal.batch_append(&values).await.unwrap();
+    let precommit_result = precommit.batch_precommit_append(&values).await.unwrap();
+
+    assert_eq!(precommit_result, normal_result);
+}
+
+#[tokio::test]
+async fn precommit_peaks_include_unchanged_peaks_from_base_state() {
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut normal = Mmr::new(
+        Arc::new(InMemoryStore::default()),
+        hasher.clone(),
+        Some(114),
+    )
+    .unwrap();
+    let mut precommit = Mmr::new(Arc::new(InMemoryStore::default()), hasher, Some(115)).unwrap();
+
+    for leaf in ["1", "2", "3", "4", "5"] {
+        normal.append(lv(leaf)).await.unwrap();
+        precommit.append(lv(leaf)).await.unwrap();
+    }
+
+    let base_peaks = precommit.get_peaks(None).await.unwrap();
+    let normal_result = normal.batch_append(&[lv("6")]).await.unwrap();
+    let precommit_result = precommit.batch_precommit_append(&[lv("6")]).await.unwrap();
+
+    assert_eq!(precommit_result.peaks_hashes, normal_result.peaks_hashes);
+    assert!(base_peaks.iter().any(|peak| precommit_result.peaks_hashes.contains(peak)));
+}
+
+#[tokio::test]
 async fn should_create_from_peaks_and_match_followup_appends() {
     let hasher = Arc::new(KeccakHasher::new());
 

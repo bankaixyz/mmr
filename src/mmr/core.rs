@@ -9,7 +9,7 @@ use crate::error::MmrError;
 use crate::hasher::Hasher;
 #[cfg(feature = "postgres-store")]
 use crate::store::PostgresStore;
-use crate::store::{KeyKind, Store, StoreKey, StoreValue};
+use crate::store::{KeyKind, PendingBatch, Store, StoreKey, StoreValue};
 use crate::types::{
     AppendResult, BatchAppendResult, ElementIndex, Hash32, MmrId, Proof, ZERO_HASH,
 };
@@ -104,6 +104,7 @@ impl<S: Store> Mmr<S> {
         if values.is_empty() {
             return Err(MmrError::EmptyBatchAppend);
         }
+        self.ensure_no_pending_precommit().await?;
 
         let append_state = self.prepare_append_state().await?;
         let AppendComputation {
@@ -118,6 +119,82 @@ impl<S: Store> Mmr<S> {
         });
 
         Ok(result)
+    }
+
+    pub async fn precommit_append(&mut self, value: Hash32) -> Result<AppendResult, MmrError> {
+        let batch_result = self.batch_precommit_append(&[value]).await?;
+        Ok(AppendResult {
+            leaves_count: batch_result.leaves_count,
+            elements_count: batch_result.elements_count,
+            element_index: batch_result.first_element_index,
+            root_hash: batch_result.root_hash,
+        })
+    }
+
+    pub async fn batch_precommit_append(
+        &mut self,
+        values: &[Hash32],
+    ) -> Result<BatchAppendResult, MmrError> {
+        if values.is_empty() {
+            return Err(MmrError::EmptyBatchAppend);
+        }
+
+        if self.store.has_pending_batch(self.mmr_id).await? {
+            return Err(MmrError::PrecommitAlreadyPending);
+        }
+
+        let append_state = self.prepare_append_state().await?;
+        let AppendComputation {
+            staged_writes,
+            result,
+        } = self.build_append_writes(values, append_state)?;
+        let pending_batch = PendingBatch {
+            staged_writes,
+            result: result.clone(),
+        };
+
+        if let Err(error) = self
+            .store
+            .create_pending_batch(self.mmr_id, pending_batch)
+            .await
+        {
+            if Self::is_pending_batch_exists_error(&error) {
+                return Err(MmrError::PrecommitAlreadyPending);
+            }
+            return Err(MmrError::from(error));
+        }
+
+        Ok(result)
+    }
+
+    pub async fn commit_precommit(&mut self) -> Result<BatchAppendResult, MmrError> {
+        let pending = self
+            .store
+            .get_pending_batch(self.mmr_id)
+            .await?
+            .ok_or(MmrError::NoPendingPrecommit)?;
+        let PendingBatch {
+            staged_writes,
+            result,
+        } = pending;
+
+        self.store.set_many(staged_writes).await?;
+        self.store.delete_pending_batch(self.mmr_id).await?;
+        self.cached_counts = Some(CachedCounts {
+            leaves_count: result.leaves_count,
+            elements_count: result.elements_count,
+        });
+
+        Ok(result)
+    }
+
+    pub async fn revert_precommit(&mut self) -> Result<(), MmrError> {
+        if !self.store.has_pending_batch(self.mmr_id).await? {
+            return Err(MmrError::NoPendingPrecommit);
+        }
+
+        self.store.delete_pending_batch(self.mmr_id).await?;
+        Ok(())
     }
 
     pub async fn get_proof(
@@ -484,6 +561,20 @@ impl<S: Store> Mmr<S> {
         }
     }
 
+    async fn ensure_no_pending_precommit(&self) -> Result<(), MmrError> {
+        if self.store.has_pending_batch(self.mmr_id).await? {
+            return Err(MmrError::AppendBlockedByPendingPrecommit);
+        }
+        Ok(())
+    }
+
+    fn is_pending_batch_exists_error(error: &crate::error::StoreError) -> bool {
+        matches!(
+            error,
+            crate::error::StoreError::PendingBatchAlreadyExists { .. }
+        )
+    }
+
     pub async fn get_leaves_count(&self) -> Result<u64, MmrError> {
         match self.store.get(&self.leaf_count_key()).await? {
             Some(value) => Ok(value.expect_u64(&self.leaf_count_key())?),
@@ -575,6 +666,7 @@ impl Mmr<Arc<PostgresStore>> {
         if values.is_empty() {
             return Err(MmrError::EmptyBatchAppend);
         }
+        self.ensure_no_pending_precommit().await?;
 
         self.cached_counts = None;
         let append_state = self.prepare_append_state_in_tx(tx).await?;

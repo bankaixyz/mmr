@@ -1,4 +1,5 @@
 use crate::store::{StoreKey, StoreValue};
+use crate::types::MmrId;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -11,6 +12,8 @@ pub enum StoreError {
         expected: &'static str,
         actual: StoreValue,
     },
+    #[error("pending batch already exists for mmr_id {mmr_id}")]
+    PendingBatchAlreadyExists { mmr_id: MmrId },
     #[cfg(feature = "postgres-store")]
     #[error("sqlx error: {0}")]
     Sqlx(#[from] sqlx::Error),
@@ -49,6 +52,12 @@ pub enum MmrError {
     InvalidPeaksCountForElements,
     #[error("cannot batch append an empty list of values")]
     EmptyBatchAppend,
+    #[error("a precommit batch is already pending")]
+    PrecommitAlreadyPending,
+    #[error("no pending precommit batch found")]
+    NoPendingPrecommit,
+    #[error("cannot append while a precommit batch is pending; commit or revert first")]
+    AppendBlockedByPendingPrecommit,
     #[error("no hash found for index {0}")]
     NoHashFoundForIndex(u64),
     #[error("arithmetic overflow")]
