@@ -35,21 +35,14 @@ pub trait Store: Send + Sync {
         &self,
         _mmr_id: MmrId,
         _batch: PendingBatch,
-    ) -> Result<(), StoreError> {
-        Err(StoreError::Internal(
-            "pending batches are not supported by this store backend".to_string(),
-        ))
-    }
-    async fn get_pending_batch(&self, _mmr_id: MmrId) -> Result<Option<PendingBatch>, StoreError> {
-        Err(StoreError::Internal(
-            "pending batches are not supported by this store backend".to_string(),
-        ))
-    }
-    async fn delete_pending_batch(&self, _mmr_id: MmrId) -> Result<(), StoreError> {
-        Err(StoreError::Internal(
-            "pending batches are not supported by this store backend".to_string(),
-        ))
-    }
+    ) -> Result<(), StoreError>;
+    async fn get_pending_batch(&self, _mmr_id: MmrId) -> Result<Option<PendingBatch>, StoreError>;
+    async fn commit_pending_batch(
+        &self,
+        _mmr_id: MmrId,
+    ) -> Result<Option<BatchAppendResult>, StoreError>;
+    async fn delete_pending_batch(&self, _mmr_id: MmrId) -> Result<(), StoreError>;
+    async fn delete_pending_batch_if_exists(&self, _mmr_id: MmrId) -> Result<bool, StoreError>;
     async fn has_pending_batch(&self, _mmr_id: MmrId) -> Result<bool, StoreError> {
         Ok(false)
     }
@@ -84,8 +77,19 @@ impl<T: Store + ?Sized> Store for Arc<T> {
         (**self).get_pending_batch(mmr_id).await
     }
 
+    async fn commit_pending_batch(
+        &self,
+        mmr_id: MmrId,
+    ) -> Result<Option<BatchAppendResult>, StoreError> {
+        (**self).commit_pending_batch(mmr_id).await
+    }
+
     async fn delete_pending_batch(&self, mmr_id: MmrId) -> Result<(), StoreError> {
         (**self).delete_pending_batch(mmr_id).await
+    }
+
+    async fn delete_pending_batch_if_exists(&self, mmr_id: MmrId) -> Result<bool, StoreError> {
+        (**self).delete_pending_batch_if_exists(mmr_id).await
     }
 
     async fn has_pending_batch(&self, mmr_id: MmrId) -> Result<bool, StoreError> {

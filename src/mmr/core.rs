@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "postgres-store")]
 use sqlx::{Postgres, Transaction};
 
-use crate::error::MmrError;
+use crate::error::{MmrError, StoreError};
 use crate::hasher::Hasher;
 #[cfg(feature = "postgres-store")]
 use crate::store::PostgresStore;
@@ -15,8 +15,9 @@ use crate::types::{
 };
 
 use super::helpers::{
-    element_index_to_leaf_index, elements_count_to_leaf_count, find_peaks, find_siblings, get_peak_info,
-    leaf_count_to_append_no_merges, leaf_count_to_peaks_count, mmr_size_to_leaf_count,
+    element_index_to_leaf_index, elements_count_to_leaf_count, find_peaks, find_siblings,
+    get_peak_info, leaf_count_to_append_no_merges, leaf_count_to_peaks_count,
+    mmr_size_to_leaf_count,
 };
 
 static NEXT_MMR_ID: AtomicU32 = AtomicU32::new(1);
@@ -155,33 +156,21 @@ impl<S: Store> Mmr<S> {
             result: result.clone(),
         };
 
-        if let Err(error) = self
-            .store
+        self.store
             .create_pending_batch(self.mmr_id, pending_batch)
             .await
-        {
-            if Self::is_pending_batch_exists_error(&error) {
-                return Err(MmrError::PrecommitAlreadyPending);
-            }
-            return Err(MmrError::from(error));
-        }
+            .map_err(Self::map_precommit_store_error)?;
 
         Ok(result)
     }
 
     pub async fn commit_precommit(&mut self) -> Result<BatchAppendResult, MmrError> {
-        let pending = self
+        let result = self
             .store
-            .get_pending_batch(self.mmr_id)
-            .await?
+            .commit_pending_batch(self.mmr_id)
+            .await
+            .map_err(Self::map_precommit_store_error)?
             .ok_or(MmrError::NoPendingPrecommit)?;
-        let PendingBatch {
-            staged_writes,
-            result,
-        } = pending;
-
-        self.store.set_many(staged_writes).await?;
-        self.store.delete_pending_batch(self.mmr_id).await?;
         self.cached_counts = Some(CachedCounts {
             leaves_count: result.leaves_count,
             elements_count: result.elements_count,
@@ -191,11 +180,14 @@ impl<S: Store> Mmr<S> {
     }
 
     pub async fn revert_precommit(&mut self) -> Result<(), MmrError> {
-        if !self.store.has_pending_batch(self.mmr_id).await? {
+        if !self
+            .store
+            .delete_pending_batch_if_exists(self.mmr_id)
+            .await?
+        {
             return Err(MmrError::NoPendingPrecommit);
         }
 
-        self.store.delete_pending_batch(self.mmr_id).await?;
         Ok(())
     }
 
@@ -582,11 +574,12 @@ impl<S: Store> Mmr<S> {
         Ok(())
     }
 
-    fn is_pending_batch_exists_error(error: &crate::error::StoreError) -> bool {
-        matches!(
-            error,
-            crate::error::StoreError::PendingBatchAlreadyExists { .. }
-        )
+    fn map_precommit_store_error(error: StoreError) -> MmrError {
+        match error {
+            StoreError::PendingBatchAlreadyExists { .. } => MmrError::PrecommitAlreadyPending,
+            StoreError::PendingBatchBaseMismatch { .. } => MmrError::PrecommitBaseStateChanged,
+            other => MmrError::Store(other),
+        }
     }
 
     pub async fn get_leaves_count(&self) -> Result<u64, MmrError> {
@@ -652,7 +645,9 @@ impl Mmr<Arc<PostgresStore>> {
         if values.is_empty() {
             return Err(MmrError::EmptyBatchAppend);
         }
-        self.ensure_no_pending_precommit().await?;
+        if self.store.has_pending_batch_in_tx(tx, self.mmr_id).await? {
+            return Err(MmrError::AppendBlockedByPendingPrecommit);
+        }
 
         self.cached_counts = None;
         let append_state = self.prepare_append_state_in_tx(tx).await?;

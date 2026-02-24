@@ -63,14 +63,25 @@ Precommit uses a pending journal per `mmr_id`:
 - Reads (`get_root_hash`, `get_peaks`, proofs) continue to reflect committed state until finalize.
 - `commit_precommit` applies staged writes to committed storage and returns the same `BatchAppendResult` produced during precommit.
 - `revert_precommit` drops the pending journal without changing committed state.
+- Precommit journaling is available with `PostgresStore` (`postgres-store` feature).
 
 ```rust
 use std::sync::Arc;
-use mmr::{InMemoryStore, KeccakHasher, Mmr};
+use mmr::{KeccakHasher, Mmr, PostgresStore, PostgresStoreOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(InMemoryStore::default());
+    let database_url = std::env::var("DATABASE_URL")?;
+    let store = Arc::new(
+        PostgresStore::connect_with_options(
+            &database_url,
+            PostgresStoreOptions {
+                initialize_schema: true,
+                max_connections: 2,
+            },
+        )
+        .await?,
+    );
     let hasher = Arc::new(KeccakHasher::new());
     let mut mmr = Mmr::new(store, hasher, Some(1))?;
 
@@ -86,6 +97,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+```
+
+Run with:
+
+```bash
+cargo run --features postgres-store
 ```
 
 ## Acknowledgements

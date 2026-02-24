@@ -14,6 +14,14 @@ pub enum StoreError {
     },
     #[error("pending batch already exists for mmr_id {mmr_id}")]
     PendingBatchAlreadyExists { mmr_id: MmrId },
+    #[error(
+        "pending batch base mismatch for mmr_id {mmr_id}: expected elements_count {expected_elements_count}, got {actual_elements_count}"
+    )]
+    PendingBatchBaseMismatch {
+        mmr_id: MmrId,
+        expected_elements_count: u64,
+        actual_elements_count: u64,
+    },
     #[cfg(feature = "postgres-store")]
     #[error("sqlx error: {0}")]
     Sqlx(#[from] sqlx::Error),
@@ -58,6 +66,8 @@ pub enum MmrError {
     NoPendingPrecommit,
     #[error("cannot append while a precommit batch is pending; commit or revert first")]
     AppendBlockedByPendingPrecommit,
+    #[error("precommit base state changed; retry from current committed state")]
+    PrecommitBaseStateChanged,
     #[error("no hash found for index {0}")]
     NoHashFoundForIndex(u64),
     #[error("arithmetic overflow")]

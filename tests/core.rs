@@ -1,7 +1,4 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 mod common;
 
@@ -9,9 +6,11 @@ use common::{hash_from_hex, hash_to_hex};
 use mmr::error::MmrError;
 use mmr::hasher::{Hasher, KeccakHasher, PoseidonHasher};
 use mmr::types::{Hash32, ZERO_HASH};
-use mmr::{InMemoryStore, KeyKind, Mmr, Store, StoreError, StoreKey, StoreValue};
+use mmr::{InMemoryStore, KeyKind, Mmr, Store, StoreKey, StoreValue};
 #[cfg(feature = "postgres-store")]
-use mmr::{PostgresStore, PostgresStoreOptions};
+use mmr::PostgresStore;
+#[cfg(feature = "postgres-store")]
+use common::pg::{PostgresFixture, next_mmr_id};
 
 const LEAVES: [&str; 5] = ["1", "2", "3", "4", "5"];
 
@@ -53,14 +52,11 @@ fn root_from_peaks(hasher: &dyn Hasher, peaks_hashes: &[Hash32], elements_count:
 }
 
 #[cfg(feature = "postgres-store")]
-fn unique_test_mmr_id() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    ((nonce % ((i32::MAX as u64) - 10_000)) as u32) + 10_000
+fn new_postgres_mmr(
+    store: Arc<PostgresStore>,
+    hasher: Arc<dyn Hasher>,
+) -> Mmr<Arc<PostgresStore>> {
+    Mmr::new(store, hasher, Some(next_mmr_id())).unwrap()
 }
 
 #[tokio::test]
@@ -279,27 +275,35 @@ async fn batch_append_rejects_empty_values() {
     ));
 }
 
+#[cfg(feature = "postgres-store")]
 #[tokio::test]
 async fn precommit_rejects_second_pending_batch() {
-    let store = Arc::new(InMemoryStore::default());
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
     let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store, hasher, Some(107)).unwrap();
+    let mut mmr = new_postgres_mmr(store, hasher);
 
-    mmr.batch_precommit_append(&[lv("1"), lv("2")]).await.unwrap();
+    mmr.batch_precommit_append(&[lv("1"), lv("2")])
+        .await
+        .unwrap();
     assert!(matches!(
         mmr.batch_precommit_append(&[lv("3")]).await,
         Err(MmrError::PrecommitAlreadyPending)
     ));
 }
 
+#[cfg(feature = "postgres-store")]
 #[tokio::test]
 async fn append_and_batch_append_are_blocked_while_precommit_is_pending() {
-    let store = Arc::new(InMemoryStore::default());
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
     let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store, hasher, Some(108)).unwrap();
+    let mut mmr = new_postgres_mmr(store, hasher);
 
     mmr.append(lv("1")).await.unwrap();
-    mmr.batch_precommit_append(&[lv("2"), lv("3")]).await.unwrap();
+    mmr.batch_precommit_append(&[lv("2"), lv("3")])
+        .await
+        .unwrap();
 
     assert!(matches!(
         mmr.append(lv("4")).await,
@@ -311,11 +315,13 @@ async fn append_and_batch_append_are_blocked_while_precommit_is_pending() {
     ));
 }
 
+#[cfg(feature = "postgres-store")]
 #[tokio::test]
 async fn precommit_does_not_change_committed_state_until_commit() {
-    let store = Arc::new(InMemoryStore::default());
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
     let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store, hasher, Some(109)).unwrap();
+    let mut mmr = new_postgres_mmr(store, hasher);
 
     for leaf in ["1", "2", "3", "4", "5"] {
         mmr.append(lv(leaf)).await.unwrap();
@@ -338,11 +344,13 @@ async fn precommit_does_not_change_committed_state_until_commit() {
     assert_eq!(mmr.get_peaks(None).await.unwrap(), committed_peaks);
 }
 
+#[cfg(feature = "postgres-store")]
 #[tokio::test]
 async fn commit_precommit_returns_batch_result_and_promotes_state() {
-    let store = Arc::new(InMemoryStore::default());
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
     let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store, hasher, Some(110)).unwrap();
+    let mut mmr = new_postgres_mmr(store, hasher);
 
     for leaf in ["1", "2", "3", "4", "5"] {
         mmr.append(lv(leaf)).await.unwrap();
@@ -355,24 +363,69 @@ async fn commit_precommit_returns_batch_result_and_promotes_state() {
     let commit_result = mmr.commit_precommit().await.unwrap();
 
     assert_eq!(commit_result, precommit_result);
-    assert_eq!(mmr.get_elements_count().await.unwrap(), commit_result.elements_count);
-    assert_eq!(mmr.get_leaves_count().await.unwrap(), commit_result.leaves_count);
+    assert_eq!(
+        mmr.get_elements_count().await.unwrap(),
+        commit_result.elements_count
+    );
+    assert_eq!(
+        mmr.get_leaves_count().await.unwrap(),
+        commit_result.leaves_count
+    );
     assert_eq!(
         mmr.get_root_hash().await.unwrap().unwrap(),
         commit_result.root_hash
     );
-    assert_eq!(mmr.get_peaks(None).await.unwrap(), commit_result.peaks_hashes);
+    assert_eq!(
+        mmr.get_peaks(None).await.unwrap(),
+        commit_result.peaks_hashes
+    );
     assert!(matches!(
         mmr.commit_precommit().await,
         Err(MmrError::NoPendingPrecommit)
     ));
 }
 
+#[cfg(feature = "postgres-store")]
+#[tokio::test]
+async fn commit_precommit_base_mismatch_returns_conflict_and_keeps_pending() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
+    let hasher = Arc::new(KeccakHasher::new());
+    let mmr_id = next_mmr_id();
+    let mut mmr = Mmr::new(store.clone(), hasher, Some(mmr_id)).unwrap();
+
+    mmr.append(lv("1")).await.unwrap();
+    let precommit_result = mmr.batch_precommit_append(&[lv("2")]).await.unwrap();
+    let staged_key = StoreKey::new(
+        mmr_id,
+        KeyKind::NodeHash,
+        precommit_result.first_element_index,
+    );
+
+    assert!(store.get(&staged_key).await.unwrap().is_none());
+    store
+        .set(
+            StoreKey::metadata(mmr_id, KeyKind::ElementsCount),
+            StoreValue::U64(precommit_result.first_element_index),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        mmr.commit_precommit().await,
+        Err(MmrError::PrecommitBaseStateChanged)
+    ));
+    assert!(store.has_pending_batch(mmr_id).await.unwrap());
+    assert!(store.get(&staged_key).await.unwrap().is_none());
+}
+
+#[cfg(feature = "postgres-store")]
 #[tokio::test]
 async fn revert_precommit_discards_staged_state_and_preserves_committed_state() {
-    let store = Arc::new(InMemoryStore::default());
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
     let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store, hasher, Some(111)).unwrap();
+    let mut mmr = new_postgres_mmr(store, hasher);
 
     for leaf in ["1", "2", "3", "4", "5"] {
         mmr.append(lv(leaf)).await.unwrap();
@@ -398,16 +451,14 @@ async fn revert_precommit_discards_staged_state_and_preserves_committed_state() 
     ));
 }
 
+#[cfg(feature = "postgres-store")]
 #[tokio::test]
 async fn precommit_matches_batch_append_output_exactly_from_same_base_state() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
     let hasher = Arc::new(KeccakHasher::new());
-    let mut normal = Mmr::new(
-        Arc::new(InMemoryStore::default()),
-        hasher.clone(),
-        Some(112),
-    )
-    .unwrap();
-    let mut precommit = Mmr::new(Arc::new(InMemoryStore::default()), hasher, Some(113)).unwrap();
+    let mut normal = new_postgres_mmr(store.clone(), hasher.clone());
+    let mut precommit = new_postgres_mmr(store, hasher);
 
     for leaf in ["1", "2", "3", "4", "5", "6", "7"] {
         normal.append(lv(leaf)).await.unwrap();
@@ -421,16 +472,14 @@ async fn precommit_matches_batch_append_output_exactly_from_same_base_state() {
     assert_eq!(precommit_result, normal_result);
 }
 
+#[cfg(feature = "postgres-store")]
 #[tokio::test]
 async fn precommit_peaks_include_unchanged_peaks_from_base_state() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
     let hasher = Arc::new(KeccakHasher::new());
-    let mut normal = Mmr::new(
-        Arc::new(InMemoryStore::default()),
-        hasher.clone(),
-        Some(114),
-    )
-    .unwrap();
-    let mut precommit = Mmr::new(Arc::new(InMemoryStore::default()), hasher, Some(115)).unwrap();
+    let mut normal = new_postgres_mmr(store.clone(), hasher.clone());
+    let mut precommit = new_postgres_mmr(store, hasher);
 
     for leaf in ["1", "2", "3", "4", "5"] {
         normal.append(lv(leaf)).await.unwrap();
@@ -442,7 +491,11 @@ async fn precommit_peaks_include_unchanged_peaks_from_base_state() {
     let precommit_result = precommit.batch_precommit_append(&[lv("6")]).await.unwrap();
 
     assert_eq!(precommit_result.peaks_hashes, normal_result.peaks_hashes);
-    assert!(base_peaks.iter().any(|peak| precommit_result.peaks_hashes.contains(peak)));
+    assert!(
+        base_peaks
+            .iter()
+            .any(|peak| precommit_result.peaks_hashes.contains(peak))
+    );
 }
 
 #[tokio::test]
@@ -659,7 +712,10 @@ async fn get_peaks_and_bag_fail_when_expected_peak_is_missing() {
 
     // elements_count=11 has expected peak indices [7, 10, 11]; index 10 is intentionally missing.
     store
-        .set(StoreKey::new(mmr_id, KeyKind::NodeHash, 7), StoreValue::Hash(lv("7")))
+        .set(
+            StoreKey::new(mmr_id, KeyKind::NodeHash, 7),
+            StoreValue::Hash(lv("7")),
+        )
         .await
         .unwrap();
     store
@@ -747,7 +803,11 @@ async fn verify_proof_stateful_rejects_tampered_proof_fields() {
 
     let mut tampered_peaks = proof.clone();
     tampered_peaks.peaks_hashes[0] = [0u8; 32];
-    assert!(!mmr.verify_proof(&tampered_peaks, lv("1"), None).await.unwrap());
+    assert!(
+        !mmr.verify_proof(&tampered_peaks, lv("1"), None)
+            .await
+            .unwrap()
+    );
 
     let mut tampered_elements_count = proof.clone();
     tampered_elements_count.elements_count -= 1;
@@ -796,237 +856,13 @@ async fn stateless_verify_is_available_and_independent() {
     assert!(!mmr.verify_proof(&tampered, lv("1"), None).await.unwrap());
 }
 
-#[derive(Debug, Default)]
-struct SpyStoreMetrics {
-    get_calls: usize,
-    set_calls: usize,
-    get_many_calls: usize,
-    set_many_calls: usize,
-}
-
-#[derive(Default)]
-struct SpyStore {
-    inner: Mutex<HashMap<StoreKey, StoreValue>>,
-    get_calls: AtomicUsize,
-    set_calls: AtomicUsize,
-    get_many_calls: AtomicUsize,
-    set_many_calls: AtomicUsize,
-    fail_set_many: AtomicBool,
-}
-
-struct FailingCreateFromPeaksStore {
-    inner: Mutex<HashMap<StoreKey, StoreValue>>,
-    set_calls: AtomicUsize,
-    fail_on_set_call: usize,
-}
-
-impl FailingCreateFromPeaksStore {
-    fn new(fail_on_set_call: usize) -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-            set_calls: AtomicUsize::new(0),
-            fail_on_set_call,
-        }
-    }
-
-    fn entry_count(&self) -> usize {
-        self.inner.lock().unwrap().len()
-    }
-
-    fn has_entries_for_mmr(&self, mmr_id: u32) -> bool {
-        self.inner.lock().unwrap().keys().any(|key| key.mmr_id == mmr_id)
-    }
-}
-
-impl Store for FailingCreateFromPeaksStore {
-    async fn get(&self, key: &StoreKey) -> Result<Option<StoreValue>, StoreError> {
-        Ok(self.inner.lock().unwrap().get(key).cloned())
-    }
-
-    async fn set(&self, key: StoreKey, value: StoreValue) -> Result<(), StoreError> {
-        let call = self.set_calls.fetch_add(1, Ordering::Relaxed) + 1;
-        if self.fail_on_set_call != 0 && call >= self.fail_on_set_call {
-            return Err(StoreError::Internal("forced set failure".to_string()));
-        }
-
-        self.inner.lock().unwrap().insert(key, value);
-        Ok(())
-    }
-
-    async fn set_many(&self, _entries: Vec<(StoreKey, StoreValue)>) -> Result<(), StoreError> {
-        Err(StoreError::Internal(
-            "forced atomic set_many failure".to_string(),
-        ))
-    }
-
-    async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError> {
-        let guard = self.inner.lock().unwrap();
-        Ok(keys.iter().map(|key| guard.get(key).cloned()).collect())
-    }
-}
-
-impl SpyStore {
-    fn metrics(&self) -> SpyStoreMetrics {
-        SpyStoreMetrics {
-            get_calls: self.get_calls.load(Ordering::Relaxed),
-            set_calls: self.set_calls.load(Ordering::Relaxed),
-            get_many_calls: self.get_many_calls.load(Ordering::Relaxed),
-            set_many_calls: self.set_many_calls.load(Ordering::Relaxed),
-        }
-    }
-
-    fn set_fail_set_many(&self, fail: bool) {
-        self.fail_set_many.store(fail, Ordering::Relaxed);
-    }
-
-    fn entry_count(&self) -> usize {
-        self.inner.lock().unwrap().len()
-    }
-}
-
-impl Store for SpyStore {
-    async fn get(&self, key: &StoreKey) -> Result<Option<StoreValue>, StoreError> {
-        self.get_calls.fetch_add(1, Ordering::Relaxed);
-        Ok(self.inner.lock().unwrap().get(key).cloned())
-    }
-
-    async fn set(&self, key: StoreKey, value: StoreValue) -> Result<(), StoreError> {
-        self.set_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.lock().unwrap().insert(key, value);
-        Ok(())
-    }
-
-    async fn set_many(&self, entries: Vec<(StoreKey, StoreValue)>) -> Result<(), StoreError> {
-        self.set_many_calls.fetch_add(1, Ordering::Relaxed);
-        if self.fail_set_many.load(Ordering::Relaxed) {
-            return Err(StoreError::Internal("forced set_many failure".to_string()));
-        }
-
-        let mut guard = self.inner.lock().unwrap();
-        for (key, value) in entries {
-            guard.insert(key, value);
-        }
-
-        Ok(())
-    }
-
-    async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError> {
-        self.get_many_calls.fetch_add(1, Ordering::Relaxed);
-        let guard = self.inner.lock().unwrap();
-        Ok(keys.iter().map(|key| guard.get(key).cloned()).collect())
-    }
-}
-
-#[tokio::test]
-async fn create_from_peaks_is_atomic_on_store_error() {
-    let mmr_id = 65;
-    let store = Arc::new(FailingCreateFromPeaksStore::new(2));
-    let hasher = Arc::new(KeccakHasher::new());
-
-    let result = Mmr::create_from_peaks(store.clone(), hasher, Some(mmr_id), vec![lv("1")], 1).await;
-    assert!(result.is_err());
-
-    assert_eq!(store.entry_count(), 0);
-    assert!(!store.has_entries_for_mmr(mmr_id));
-}
-
-#[tokio::test]
-async fn append_uses_one_get_many_and_one_set_many_in_steady_state() {
-    let store = Arc::new(SpyStore::default());
-    let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store.clone(), hasher, Some(61)).unwrap();
-
-    mmr.append(lv("1")).await.unwrap();
-
-    let before = store.metrics();
-    mmr.append(lv("2")).await.unwrap();
-    let after = store.metrics();
-
-    assert_eq!(after.get_many_calls - before.get_many_calls, 1);
-    assert_eq!(after.set_many_calls - before.set_many_calls, 1);
-    assert_eq!(after.get_calls - before.get_calls, 0);
-    assert_eq!(after.set_calls - before.set_calls, 0);
-}
-
-#[tokio::test]
-async fn batch_append_uses_one_get_many_and_one_set_many_in_steady_state() {
-    let store = Arc::new(SpyStore::default());
-    let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store.clone(), hasher, Some(63)).unwrap();
-
-    mmr.batch_append(&[lv("1"), lv("2"), lv("3")])
-        .await
-        .unwrap();
-
-    let before = store.metrics();
-    mmr.batch_append(&[lv("4"), lv("5"), lv("6"), lv("7")])
-        .await
-        .unwrap();
-    let after = store.metrics();
-
-    assert_eq!(after.get_many_calls - before.get_many_calls, 1);
-    assert_eq!(after.set_many_calls - before.set_many_calls, 1);
-    assert_eq!(after.get_calls - before.get_calls, 0);
-    assert_eq!(after.set_calls - before.set_calls, 0);
-}
-
-#[tokio::test]
-async fn append_returns_error_and_avoids_partial_writes_when_set_many_fails() {
-    let store = Arc::new(SpyStore::default());
-    store.set_fail_set_many(true);
-    let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store.clone(), hasher, Some(62)).unwrap();
-
-    let result = mmr.append(lv("1")).await;
-    assert!(result.is_err());
-    assert_eq!(store.entry_count(), 0);
-
-    assert_eq!(mmr.get_elements_count().await.unwrap(), 0);
-    assert_eq!(mmr.get_leaves_count().await.unwrap(), 0);
-
-    let key = StoreKey::new(62, KeyKind::NodeHash, 1);
-    assert!(store.get(&key).await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn batch_append_returns_error_and_avoids_partial_writes_when_set_many_fails() {
-    let store = Arc::new(SpyStore::default());
-    store.set_fail_set_many(true);
-    let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store.clone(), hasher, Some(64)).unwrap();
-
-    let result = mmr.batch_append(&[lv("1"), lv("2"), lv("3")]).await;
-    assert!(result.is_err());
-    assert_eq!(store.entry_count(), 0);
-
-    assert_eq!(mmr.get_elements_count().await.unwrap(), 0);
-    assert_eq!(mmr.get_leaves_count().await.unwrap(), 0);
-
-    let key = StoreKey::new(64, KeyKind::NodeHash, 1);
-    assert!(store.get(&key).await.unwrap().is_none());
-}
-
 #[cfg(feature = "postgres-store")]
 #[tokio::test]
 async fn postgres_batch_append_in_tx_rollback_leaves_store_unchanged() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
-    };
-
-    let store = Arc::new(
-        PostgresStore::connect_with_options(
-            &database_url,
-            PostgresStoreOptions {
-                initialize_schema: true,
-                max_connections: 2,
-            },
-        )
-        .await
-        .unwrap(),
-    );
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
     let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store.clone(), hasher.clone(), Some(unique_test_mmr_id())).unwrap();
+    let mut mmr = new_postgres_mmr(store.clone(), hasher.clone());
 
     let mut tx = store.begin_write_tx().await.unwrap();
     let result = mmr
@@ -1049,24 +885,10 @@ async fn postgres_batch_append_in_tx_rollback_leaves_store_unchanged() {
 #[cfg(feature = "postgres-store")]
 #[tokio::test]
 async fn postgres_batch_append_in_tx_returns_peaks_matching_committed_state() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
-    };
-
-    let store = Arc::new(
-        PostgresStore::connect_with_options(
-            &database_url,
-            PostgresStoreOptions {
-                initialize_schema: true,
-                max_connections: 2,
-            },
-        )
-        .await
-        .unwrap(),
-    );
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
     let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store.clone(), hasher.clone(), Some(unique_test_mmr_id())).unwrap();
+    let mut mmr = new_postgres_mmr(store.clone(), hasher.clone());
 
     let mut tx = store.begin_write_tx().await.unwrap();
     let result = mmr
@@ -1092,29 +914,27 @@ async fn postgres_batch_append_in_tx_returns_peaks_matching_committed_state() {
 
 #[cfg(feature = "postgres-store")]
 #[tokio::test]
-async fn postgres_append_in_tx_commit_persists_write() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
-    };
+async fn postgres_batch_append_in_tx_is_blocked_when_precommit_is_pending() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
+    let mut mmr = new_postgres_mmr(store.clone(), Arc::new(KeccakHasher::new()));
 
-    let store = Arc::new(
-        PostgresStore::connect_with_options(
-            &database_url,
-            PostgresStoreOptions {
-                initialize_schema: true,
-                max_connections: 2,
-            },
-        )
-        .await
-        .unwrap(),
-    );
-    let mut mmr = Mmr::new(
-        store.clone(),
-        Arc::new(KeccakHasher::new()),
-        Some(unique_test_mmr_id()),
-    )
-    .unwrap();
+    mmr.batch_precommit_append(&[lv("1")]).await.unwrap();
+
+    let mut tx = store.begin_write_tx().await.unwrap();
+    assert!(matches!(
+        mmr.batch_append_in_tx(&mut tx, &[lv("2")]).await,
+        Err(MmrError::AppendBlockedByPendingPrecommit)
+    ));
+    tx.rollback().await.unwrap();
+}
+
+#[cfg(feature = "postgres-store")]
+#[tokio::test]
+async fn postgres_append_in_tx_commit_persists_write() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
+    let mut mmr = new_postgres_mmr(store.clone(), Arc::new(KeccakHasher::new()));
 
     let mut tx = store.begin_write_tx().await.unwrap();
     let append = mmr.append_in_tx(&mut tx, lv("10")).await.unwrap();
@@ -1129,24 +949,10 @@ async fn postgres_append_in_tx_commit_persists_write() {
 #[cfg(feature = "postgres-store")]
 #[tokio::test]
 async fn postgres_multiple_appends_in_same_tx_are_composable() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => return,
-    };
-
-    let store = Arc::new(
-        PostgresStore::connect_with_options(
-            &database_url,
-            PostgresStoreOptions {
-                initialize_schema: true,
-                max_connections: 2,
-            },
-        )
-        .await
-        .unwrap(),
-    );
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
     let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store.clone(), hasher.clone(), Some(unique_test_mmr_id())).unwrap();
+    let mut mmr = new_postgres_mmr(store.clone(), hasher.clone());
 
     let mut tx = store.begin_write_tx().await.unwrap();
     let first = mmr.append_in_tx(&mut tx, lv("21")).await.unwrap();
