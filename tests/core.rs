@@ -637,6 +637,52 @@ async fn should_handle_create_from_peaks_edge_cases() {
 }
 
 #[tokio::test]
+async fn create_from_peaks_rejects_invalid_elements_count() {
+    let hasher = Arc::new(KeccakHasher::new());
+    let result = Mmr::create_from_peaks(
+        Arc::new(InMemoryStore::default()),
+        hasher,
+        Some(25),
+        vec![],
+        2,
+    )
+    .await;
+
+    assert!(matches!(result, Err(MmrError::InvalidElementCount)));
+}
+
+#[tokio::test]
+async fn get_peaks_and_bag_fail_when_expected_peak_is_missing() {
+    let store = Arc::new(InMemoryStore::default());
+    let hasher = Arc::new(KeccakHasher::new());
+    let mmr_id = 26;
+
+    // elements_count=11 has expected peak indices [7, 10, 11]; index 10 is intentionally missing.
+    store
+        .set(StoreKey::new(mmr_id, KeyKind::NodeHash, 7), StoreValue::Hash(lv("7")))
+        .await
+        .unwrap();
+    store
+        .set(
+            StoreKey::new(mmr_id, KeyKind::NodeHash, 11),
+            StoreValue::Hash(lv("11")),
+        )
+        .await
+        .unwrap();
+
+    let mmr = Mmr::new(store, hasher, Some(mmr_id)).unwrap();
+
+    assert!(matches!(
+        mmr.get_peaks(Some(11)).await,
+        Err(MmrError::NoHashFoundForIndex(10))
+    ));
+    assert!(matches!(
+        mmr.bag_the_peaks(Some(11)).await,
+        Err(MmrError::NoHashFoundForIndex(10))
+    ));
+}
+
+#[tokio::test]
 async fn should_keep_multiple_mmrs_isolated_in_one_store() {
     let shared_store = Arc::new(InMemoryStore::default());
     let hasher = Arc::new(KeccakHasher::new());
@@ -687,6 +733,39 @@ async fn should_reject_invalid_index_and_fail_on_malformed_siblings() {
     assert!(!mmr.verify_proof(&proof, lv("1"), None).await.unwrap());
 }
 
+#[tokio::test]
+async fn verify_proof_stateful_rejects_tampered_proof_fields() {
+    let store = Arc::new(InMemoryStore::default());
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store, hasher, Some(52)).unwrap();
+    mmr.append(lv("1")).await.unwrap();
+    mmr.append(lv("2")).await.unwrap();
+    mmr.append(lv("3")).await.unwrap();
+
+    let proof = mmr.get_proof(1, None).await.unwrap();
+    assert!(mmr.verify_proof(&proof, lv("1"), None).await.unwrap());
+
+    let mut tampered_peaks = proof.clone();
+    tampered_peaks.peaks_hashes[0] = [0u8; 32];
+    assert!(!mmr.verify_proof(&tampered_peaks, lv("1"), None).await.unwrap());
+
+    let mut tampered_elements_count = proof.clone();
+    tampered_elements_count.elements_count -= 1;
+    assert!(
+        !mmr.verify_proof(&tampered_elements_count, lv("1"), None)
+            .await
+            .unwrap()
+    );
+
+    let mut tampered_element_hash = proof;
+    tampered_element_hash.element_hash = [0u8; 32];
+    assert!(
+        !mmr.verify_proof(&tampered_element_hash, lv("1"), None)
+            .await
+            .unwrap()
+    );
+}
+
 #[cfg(feature = "stateless-verify")]
 #[tokio::test]
 async fn stateless_verify_is_available_and_independent() {
@@ -714,7 +793,7 @@ async fn stateless_verify_is_available_and_independent() {
             .unwrap()
     );
 
-    assert!(mmr.verify_proof(&tampered, lv("1"), None).await.unwrap());
+    assert!(!mmr.verify_proof(&tampered, lv("1"), None).await.unwrap());
 }
 
 #[derive(Debug, Default)]
@@ -733,6 +812,57 @@ struct SpyStore {
     get_many_calls: AtomicUsize,
     set_many_calls: AtomicUsize,
     fail_set_many: AtomicBool,
+}
+
+struct FailingCreateFromPeaksStore {
+    inner: Mutex<HashMap<StoreKey, StoreValue>>,
+    set_calls: AtomicUsize,
+    fail_on_set_call: usize,
+}
+
+impl FailingCreateFromPeaksStore {
+    fn new(fail_on_set_call: usize) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            set_calls: AtomicUsize::new(0),
+            fail_on_set_call,
+        }
+    }
+
+    fn entry_count(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    fn has_entries_for_mmr(&self, mmr_id: u32) -> bool {
+        self.inner.lock().unwrap().keys().any(|key| key.mmr_id == mmr_id)
+    }
+}
+
+impl Store for FailingCreateFromPeaksStore {
+    async fn get(&self, key: &StoreKey) -> Result<Option<StoreValue>, StoreError> {
+        Ok(self.inner.lock().unwrap().get(key).cloned())
+    }
+
+    async fn set(&self, key: StoreKey, value: StoreValue) -> Result<(), StoreError> {
+        let call = self.set_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.fail_on_set_call != 0 && call >= self.fail_on_set_call {
+            return Err(StoreError::Internal("forced set failure".to_string()));
+        }
+
+        self.inner.lock().unwrap().insert(key, value);
+        Ok(())
+    }
+
+    async fn set_many(&self, _entries: Vec<(StoreKey, StoreValue)>) -> Result<(), StoreError> {
+        Err(StoreError::Internal(
+            "forced atomic set_many failure".to_string(),
+        ))
+    }
+
+    async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError> {
+        let guard = self.inner.lock().unwrap();
+        Ok(keys.iter().map(|key| guard.get(key).cloned()).collect())
+    }
 }
 
 impl SpyStore {
@@ -785,6 +915,19 @@ impl Store for SpyStore {
         let guard = self.inner.lock().unwrap();
         Ok(keys.iter().map(|key| guard.get(key).cloned()).collect())
     }
+}
+
+#[tokio::test]
+async fn create_from_peaks_is_atomic_on_store_error() {
+    let mmr_id = 65;
+    let store = Arc::new(FailingCreateFromPeaksStore::new(2));
+    let hasher = Arc::new(KeccakHasher::new());
+
+    let result = Mmr::create_from_peaks(store.clone(), hasher, Some(mmr_id), vec![lv("1")], 1).await;
+    assert!(result.is_err());
+
+    assert_eq!(store.entry_count(), 0);
+    assert!(!store.has_entries_for_mmr(mmr_id));
 }
 
 #[tokio::test]

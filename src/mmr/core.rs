@@ -15,7 +15,7 @@ use crate::types::{
 };
 
 use super::helpers::{
-    element_index_to_leaf_index, find_peaks, find_siblings, get_peak_info,
+    element_index_to_leaf_index, elements_count_to_leaf_count, find_peaks, find_siblings, get_peak_info,
     leaf_count_to_append_no_merges, leaf_count_to_peaks_count, mmr_size_to_leaf_count,
 };
 
@@ -71,17 +71,19 @@ impl<S: Store> Mmr<S> {
             return Err(MmrError::InvalidPeaksCountForElements);
         }
 
-        let leaves_count = mmr_size_to_leaf_count(elements_count);
-        mmr.set_leaves_count(leaves_count).await?;
-        mmr.set_elements_count(elements_count).await?;
-
-        for (peak_index, peak_hash) in expected_peak_indices.iter().zip(peaks_hashes.iter()) {
-            mmr.set_node_hash(*peak_index, *peak_hash).await?;
-        }
-
-        let bag = mmr.bag_the_peaks(Some(elements_count)).await?;
+        let leaves_count = elements_count_to_leaf_count(elements_count)?;
+        let bag = mmr.bag_peaks_hashes(&expected_peak_indices, &peaks_hashes)?;
         let root_hash = mmr.calculate_root_hash(&bag, elements_count)?;
-        mmr.set_root_hash(root_hash).await?;
+
+        let mut staged_writes = Vec::with_capacity(peaks_hashes.len().saturating_add(3));
+        staged_writes.push((mmr.leaf_count_key(), StoreValue::U64(leaves_count)));
+        staged_writes.push((mmr.elements_count_key(), StoreValue::U64(elements_count)));
+        for (peak_index, peak_hash) in expected_peak_indices.iter().zip(peaks_hashes.iter()) {
+            staged_writes.push((mmr.node_key(*peak_index), StoreValue::Hash(*peak_hash)));
+        }
+        staged_writes.push((mmr.root_hash_key(), StoreValue::Hash(root_hash)));
+
+        mmr.store.set_many(staged_writes).await?;
         mmr.cached_counts = Some(CachedCounts {
             leaves_count,
             elements_count,
@@ -224,9 +226,8 @@ impl<S: Store> Mmr<S> {
         let sibling_values = self.store.get_many(&sibling_keys).await?;
         let mut siblings_hashes = Vec::new();
         for (key, value) in sibling_keys.iter().zip(sibling_values.into_iter()) {
-            if let Some(value) = value {
-                siblings_hashes.push(value.expect_hash(key)?);
-            }
+            let value = value.ok_or(MmrError::NoHashFoundForIndex(key.index))?;
+            siblings_hashes.push(value.expect_hash(key)?);
         }
 
         let element_hash = self
@@ -264,6 +265,14 @@ impl<S: Store> Mmr<S> {
             return Err(MmrError::InvalidElementIndex);
         }
 
+        if proof.elements_count != tree_size {
+            return Ok(false);
+        }
+
+        if proof.element_hash != element_value {
+            return Ok(false);
+        }
+
         let (peak_index, peak_height) = get_peak_info(tree_size, proof.element_index);
         if proof.siblings_hashes.len() != peak_height {
             return Ok(false);
@@ -283,6 +292,9 @@ impl<S: Store> Mmr<S> {
         }
 
         let peak_hashes = self.retrieve_peaks_hashes(find_peaks(tree_size)).await?;
+        if proof.peaks_hashes != peak_hashes {
+            return Ok(false);
+        }
 
         Ok(peak_hashes.get(peak_index).copied() == Some(hash))
     }
@@ -398,10 +410,9 @@ impl<S: Store> Mmr<S> {
         let values = self.store.get_many(&keys).await?;
 
         let mut hashes = Vec::with_capacity(values.len());
-        for (key, value) in keys.iter().zip(values.into_iter()) {
-            if let Some(value) = value {
-                hashes.push(value.expect_hash(key)?);
-            }
+        for ((peak_idx, key), value) in peak_idxs.iter().zip(keys.iter()).zip(values.into_iter()) {
+            let value = value.ok_or(MmrError::NoHashFoundForIndex(*peak_idx))?;
+            hashes.push(value.expect_hash(key)?);
         }
 
         Ok(hashes)
@@ -470,10 +481,13 @@ impl<S: Store> Mmr<S> {
             Self::extract_counter(&elements_count_key, values.get(1).cloned().flatten())?;
 
         let mut peaks_hashes = Vec::with_capacity(peak_indices.len());
-        for (key, value) in keys[2..].iter().zip(values.into_iter().skip(2)) {
-            if let Some(value) = value {
-                peaks_hashes.push(value.expect_hash(key)?);
-            }
+        for ((peak_idx, key), value) in peak_indices
+            .iter()
+            .zip(keys[2..].iter())
+            .zip(values.into_iter().skip(2))
+        {
+            let value = value.ok_or(MmrError::NoHashFoundForIndex(*peak_idx))?;
+            peaks_hashes.push(value.expect_hash(key)?);
         }
 
         Ok(AppendState {
@@ -582,32 +596,11 @@ impl<S: Store> Mmr<S> {
         }
     }
 
-    async fn set_leaves_count(&self, value: u64) -> Result<(), MmrError> {
-        self.store
-            .set(self.leaf_count_key(), StoreValue::U64(value))
-            .await
-            .map_err(MmrError::from)
-    }
-
     pub async fn get_elements_count(&self) -> Result<u64, MmrError> {
         match self.store.get(&self.elements_count_key()).await? {
             Some(value) => Ok(value.expect_u64(&self.elements_count_key())?),
             None => Ok(0),
         }
-    }
-
-    async fn set_elements_count(&self, value: u64) -> Result<(), MmrError> {
-        self.store
-            .set(self.elements_count_key(), StoreValue::U64(value))
-            .await
-            .map_err(MmrError::from)
-    }
-
-    async fn set_root_hash(&self, hash: Hash32) -> Result<(), MmrError> {
-        self.store
-            .set(self.root_hash_key(), StoreValue::Hash(hash))
-            .await
-            .map_err(MmrError::from)
     }
 
     async fn get_node_hash(&self, index: u64) -> Result<Option<Hash32>, MmrError> {
@@ -616,13 +609,6 @@ impl<S: Store> Mmr<S> {
             Some(value) => Ok(Some(value.expect_hash(&key)?)),
             None => Ok(None),
         }
-    }
-
-    async fn set_node_hash(&self, index: u64, hash: Hash32) -> Result<(), MmrError> {
-        self.store
-            .set(self.node_key(index), StoreValue::Hash(hash))
-            .await
-            .map_err(MmrError::from)
     }
 
     fn leaf_count_key(&self) -> StoreKey {
@@ -726,10 +712,13 @@ impl Mmr<Arc<PostgresStore>> {
             Self::extract_counter(&elements_count_key, values.get(1).cloned().flatten())?;
 
         let mut peaks_hashes = Vec::with_capacity(peak_indices.len());
-        for (key, value) in keys[2..].iter().zip(values.into_iter().skip(2)) {
-            if let Some(value) = value {
-                peaks_hashes.push(value.expect_hash(key)?);
-            }
+        for ((peak_idx, key), value) in peak_indices
+            .iter()
+            .zip(keys[2..].iter())
+            .zip(values.into_iter().skip(2))
+        {
+            let value = value.ok_or(MmrError::NoHashFoundForIndex(*peak_idx))?;
+            peaks_hashes.push(value.expect_hash(key)?);
         }
 
         Ok(AppendState {
