@@ -43,8 +43,8 @@ pub mod pg {
     use std::sync::Arc;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
     use std::time::Duration;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use mmr::{PostgresStore, PostgresStoreOptions};
     use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -90,7 +90,8 @@ pub mod pg {
                 let container = match start {
                     Ok(Ok(container)) => container,
                     Ok(Err(error)) => {
-                        last_error = Some(format!("failed to start postgres test container: {error}"));
+                        last_error =
+                            Some(format!("failed to start postgres test container: {error}"));
                         continue;
                     }
                     Err(_) => {
@@ -102,14 +103,17 @@ pub mod pg {
                 let host = match container.get_host().await {
                     Ok(host) => host,
                     Err(error) => {
-                        last_error = Some(format!("failed to resolve postgres container host: {error}"));
+                        last_error = Some(format!(
+                            "failed to resolve postgres container host: {error}"
+                        ));
                         continue;
                     }
                 };
                 let port = match container.get_host_port_ipv4(5432.tcp()).await {
                     Ok(port) => port,
                     Err(error) => {
-                        last_error = Some(format!("failed to resolve postgres mapped port: {error}"));
+                        last_error =
+                            Some(format!("failed to resolve postgres mapped port: {error}"));
                         continue;
                     }
                 };

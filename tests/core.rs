@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 mod common;
 
+#[cfg(feature = "postgres-store")]
+use common::pg::{PostgresFixture, next_mmr_id};
 use common::{hash_from_hex, hash_to_hex};
+#[cfg(feature = "postgres-store")]
+use mmr::PostgresStore;
 use mmr::error::MmrError;
 use mmr::hasher::{Hasher, KeccakHasher, PoseidonHasher};
 use mmr::types::{Hash32, ZERO_HASH};
 use mmr::{InMemoryStore, KeyKind, Mmr, Store, StoreKey, StoreValue};
-#[cfg(feature = "postgres-store")]
-use mmr::PostgresStore;
-#[cfg(feature = "postgres-store")]
-use common::pg::{PostgresFixture, next_mmr_id};
 
 const LEAVES: [&str; 5] = ["1", "2", "3", "4", "5"];
 
@@ -52,10 +52,7 @@ fn root_from_peaks(hasher: &dyn Hasher, peaks_hashes: &[Hash32], elements_count:
 }
 
 #[cfg(feature = "postgres-store")]
-fn new_postgres_mmr(
-    store: Arc<PostgresStore>,
-    hasher: Arc<dyn Hasher>,
-) -> Mmr<Arc<PostgresStore>> {
+fn new_postgres_mmr(store: Arc<PostgresStore>, hasher: Arc<dyn Hasher>) -> Mmr<Arc<PostgresStore>> {
     Mmr::new(store, hasher, Some(next_mmr_id())).unwrap()
 }
 
@@ -995,9 +992,18 @@ async fn postgres_commit_precommit_in_tx_promotes_state_after_outer_commit() {
     assert_eq!(committed, staged);
     tx.commit().await.unwrap();
 
-    assert_eq!(mmr.get_elements_count().await.unwrap(), committed.elements_count);
-    assert_eq!(mmr.get_leaves_count().await.unwrap(), committed.leaves_count);
-    assert_eq!(mmr.get_root_hash().await.unwrap().unwrap(), committed.root_hash);
+    assert_eq!(
+        mmr.get_elements_count().await.unwrap(),
+        committed.elements_count
+    );
+    assert_eq!(
+        mmr.get_leaves_count().await.unwrap(),
+        committed.leaves_count
+    );
+    assert_eq!(
+        mmr.get_root_hash().await.unwrap().unwrap(),
+        committed.root_hash
+    );
     assert_eq!(mmr.get_peaks(None).await.unwrap(), committed.peaks_hashes);
     assert!(!store.has_pending_batch(mmr.mmr_id).await.unwrap());
 }

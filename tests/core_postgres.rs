@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 mod common;
 
-use common::pg::{PostgresFixture, next_mmr_id};
 use common::hash_from_hex;
+use common::pg::{PostgresFixture, next_mmr_id};
 use mmr::error::MmrError;
 use mmr::hasher::{Hasher, KeccakHasher, PoseidonHasher};
 use mmr::types::{Hash32, ZERO_HASH};
@@ -90,15 +90,13 @@ async fn postgres_batch_append_matches_repeated_append_for_identical_values() {
     let hasher = Arc::new(KeccakHasher::new());
     let leaves = ["1", "2", "3", "4", "5", "6", "7", "8"];
 
-    let mut single =
-        Mmr::new(fixture.store.clone(), hasher.clone(), Some(next_mmr_id())).unwrap();
+    let mut single = Mmr::new(fixture.store.clone(), hasher.clone(), Some(next_mmr_id())).unwrap();
     let mut single_appends = Vec::new();
     for leaf in leaves {
         single_appends.push(single.append(lv(leaf)).await.unwrap());
     }
 
-    let mut batched =
-        Mmr::new(fixture.store.clone(), hasher.clone(), Some(next_mmr_id())).unwrap();
+    let mut batched = Mmr::new(fixture.store.clone(), hasher.clone(), Some(next_mmr_id())).unwrap();
     let batch_values = leaves.iter().map(|leaf| lv(leaf)).collect::<Vec<_>>();
     let batch_result = batched.batch_append(&batch_values).await.unwrap();
 

@@ -261,7 +261,10 @@ impl PostgresStore {
     ) -> Result<bool, StoreError> {
         let mmr_id_pg = to_pg_mmr_id(mmr_id)?;
         let query = self.delete_pending_batch_query();
-        let outcome = sqlx::query(&query).bind(mmr_id_pg).execute(&mut **tx).await?;
+        let outcome = sqlx::query(&query)
+            .bind(mmr_id_pg)
+            .execute(&mut **tx)
+            .await?;
         Ok(outcome.rows_affected() > 0)
     }
 
@@ -565,7 +568,10 @@ impl Store for PostgresStore {
         batch: PendingBatch,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        if let Err(error) = self.create_pending_batch_in_tx(&mut tx, mmr_id, batch).await {
+        if let Err(error) = self
+            .create_pending_batch_in_tx(&mut tx, mmr_id, batch)
+            .await
+        {
             tx.rollback().await?;
             return Err(error);
         }
