@@ -105,6 +105,44 @@ Run with:
 cargo run --features postgres-store
 ```
 
+### Transactional Precommit Flow
+
+If your backend already controls the SQL transaction, use the `*_in_tx` variants:
+
+```rust
+use std::sync::Arc;
+use mmr::{KeccakHasher, Mmr, PostgresStore, PostgresStoreOptions};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")?;
+    let store = Arc::new(
+        PostgresStore::connect_with_options(
+            &database_url,
+            PostgresStoreOptions {
+                initialize_schema: true,
+                max_connections: 2,
+            },
+        )
+        .await?,
+    );
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store.clone(), hasher, Some(1))?;
+
+    let mut tx = store.begin_write_tx().await?;
+    let staged = mmr
+        .batch_precommit_append_in_tx(&mut tx, &[[1u8; 32], [2u8; 32], [3u8; 32]])
+        .await?;
+    let committed = mmr.commit_precommit_in_tx(&mut tx).await?;
+    tx.commit().await?;
+
+    assert_eq!(staged, committed);
+    Ok(())
+}
+```
+
+To discard staged state inside an existing transaction, call `revert_precommit_in_tx(&mut tx)` and then commit or roll back the outer transaction as needed.
+
 ## Acknowledgements
 
 Thanks to Herodotus for their work on MMRs and open-source reference implementations:

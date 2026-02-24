@@ -140,6 +140,162 @@ impl PostgresStore {
         Ok(row.is_some())
     }
 
+    pub(crate) async fn create_pending_batch_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        mmr_id: MmrId,
+        batch: PendingBatch,
+    ) -> Result<(), StoreError> {
+        let expected_elements_count =
+            expected_pending_batch_elements_count(mmr_id, batch.result.first_element_index)?;
+        let actual_elements_count = self.get_elements_count_in_tx(tx, mmr_id).await?;
+        if actual_elements_count != expected_elements_count {
+            return Err(StoreError::PendingBatchBaseMismatch {
+                mmr_id,
+                expected_elements_count,
+                actual_elements_count,
+            });
+        }
+
+        let mmr_id_pg = to_pg_mmr_id(mmr_id)?;
+        let appended_count = to_pg_idx(batch.result.appended_count)?;
+        let first_element_index = to_pg_idx(batch.result.first_element_index)?;
+        let last_element_index = to_pg_idx(batch.result.last_element_index)?;
+        let leaves_count = to_pg_idx(batch.result.leaves_count)?;
+        let elements_count = to_pg_idx(batch.result.elements_count)?;
+        let root_hash = batch.result.root_hash.to_vec();
+        let peaks_hashes = encode_peaks_hashes(&batch.result.peaks_hashes);
+        let entries_query = self.create_pending_entries_query();
+        let batch_query = self.create_pending_batch_query();
+
+        let inserted = sqlx::query(&batch_query)
+            .bind(mmr_id_pg)
+            .bind(appended_count)
+            .bind(first_element_index)
+            .bind(last_element_index)
+            .bind(leaves_count)
+            .bind(elements_count)
+            .bind(root_hash)
+            .bind(peaks_hashes)
+            .execute(&mut **tx)
+            .await?;
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::PendingBatchAlreadyExists { mmr_id });
+        }
+
+        if !batch.staged_writes.is_empty() {
+            let (ords, kinds, indices, values) =
+                prepare_pending_entries(mmr_id, &batch.staged_writes)?;
+
+            sqlx::query(&entries_query)
+                .bind(mmr_id_pg)
+                .bind(&ords)
+                .bind(&kinds)
+                .bind(&indices)
+                .bind(&values)
+                .execute(&mut **tx)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn commit_pending_batch_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        mmr_id: MmrId,
+    ) -> Result<Option<BatchAppendResult>, StoreError> {
+        let mmr_id_pg = to_pg_mmr_id(mmr_id)?;
+        let batch_query = format!("{} FOR UPDATE", self.get_pending_batch_query());
+        let entries_query = self.get_pending_entries_query();
+        let delete_query = self.delete_pending_batch_query();
+
+        let row = sqlx::query(&batch_query)
+            .bind(mmr_id_pg)
+            .fetch_optional(&mut **tx)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let result = decode_pending_batch_result(&row)?;
+        let expected_elements_count =
+            expected_pending_batch_elements_count(mmr_id, result.first_element_index)?;
+
+        let rows = sqlx::query(&entries_query)
+            .bind(mmr_id_pg)
+            .fetch_all(&mut **tx)
+            .await?;
+        let mut staged_writes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let kind = kind_from_i16(row.try_get::<i16, _>("kind")?)?;
+            let idx = to_u64(row.try_get::<i64, _>("idx")?, "idx")?;
+            let key = StoreKey::new(mmr_id, kind, idx);
+            let value_bytes: Vec<u8> = row.try_get("value")?;
+            let value = decode_store_value(&key, &value_bytes)?;
+            staged_writes.push((key, value));
+        }
+
+        let actual_elements_count = self.get_elements_count_in_tx(tx, mmr_id).await?;
+        if actual_elements_count != expected_elements_count {
+            return Err(StoreError::PendingBatchBaseMismatch {
+                mmr_id,
+                expected_elements_count,
+                actual_elements_count,
+            });
+        }
+
+        self.set_many_in_tx(tx, staged_writes).await?;
+        sqlx::query(&delete_query)
+            .bind(mmr_id_pg)
+            .execute(&mut **tx)
+            .await?;
+
+        Ok(Some(result))
+    }
+
+    pub(crate) async fn delete_pending_batch_if_exists_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        mmr_id: MmrId,
+    ) -> Result<bool, StoreError> {
+        let mmr_id_pg = to_pg_mmr_id(mmr_id)?;
+        let query = self.delete_pending_batch_query();
+        let outcome = sqlx::query(&query).bind(mmr_id_pg).execute(&mut **tx).await?;
+        Ok(outcome.rows_affected() > 0)
+    }
+
+    async fn get_elements_count_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        mmr_id: MmrId,
+    ) -> Result<u64, StoreError> {
+        let mmr_id_pg = to_pg_mmr_id(mmr_id)?;
+        let query = format!(
+            "SELECT value
+            FROM {}
+            WHERE mmr_id = $1
+              AND kind = $2
+              AND idx = 0
+            FOR UPDATE",
+            self.table_name
+        );
+        let key = StoreKey::metadata(mmr_id, KeyKind::ElementsCount);
+        let row = sqlx::query(&query)
+            .bind(mmr_id_pg)
+            .bind(kind_to_i16(KeyKind::ElementsCount))
+            .fetch_optional(&mut **tx)
+            .await?;
+
+        match row {
+            Some(row) => {
+                let value: Vec<u8> = row.try_get("value")?;
+                decode_store_value(&key, &value)?.expect_u64(&key)
+            }
+            None => Ok(0),
+        }
+    }
+
     fn create_table_sql(&self) -> String {
         format!(
             "CREATE TABLE IF NOT EXISTS {table} (
@@ -408,72 +564,11 @@ impl Store for PostgresStore {
         mmr_id: MmrId,
         batch: PendingBatch,
     ) -> Result<(), StoreError> {
-        let expected_elements_count =
-            batch
-                .result
-                .first_element_index
-                .checked_sub(1)
-                .ok_or_else(|| {
-                    StoreError::Internal(format!(
-                        "invalid pending batch first_element_index 0 for mmr_id {mmr_id}"
-                    ))
-                })?;
-        let elements_key = StoreKey::metadata(mmr_id, KeyKind::ElementsCount);
-        let actual_elements_count = match self.get(&elements_key).await? {
-            Some(value) => value.expect_u64(&elements_key)?,
-            None => 0,
-        };
-        if actual_elements_count != expected_elements_count {
-            return Err(StoreError::PendingBatchBaseMismatch {
-                mmr_id,
-                expected_elements_count,
-                actual_elements_count,
-            });
-        }
-
-        let mmr_id_pg = to_pg_mmr_id(mmr_id)?;
-        let appended_count = to_pg_idx(batch.result.appended_count)?;
-        let first_element_index = to_pg_idx(batch.result.first_element_index)?;
-        let last_element_index = to_pg_idx(batch.result.last_element_index)?;
-        let leaves_count = to_pg_idx(batch.result.leaves_count)?;
-        let elements_count = to_pg_idx(batch.result.elements_count)?;
-        let root_hash = batch.result.root_hash.to_vec();
-        let peaks_hashes = encode_peaks_hashes(&batch.result.peaks_hashes);
-        let entries_query = self.create_pending_entries_query();
-        let batch_query = self.create_pending_batch_query();
         let mut tx = self.pool.begin().await?;
-
-        let inserted = sqlx::query(&batch_query)
-            .bind(mmr_id_pg)
-            .bind(appended_count)
-            .bind(first_element_index)
-            .bind(last_element_index)
-            .bind(leaves_count)
-            .bind(elements_count)
-            .bind(root_hash)
-            .bind(peaks_hashes)
-            .execute(&mut *tx)
-            .await?;
-
-        if inserted.rows_affected() == 0 {
+        if let Err(error) = self.create_pending_batch_in_tx(&mut tx, mmr_id, batch).await {
             tx.rollback().await?;
-            return Err(StoreError::PendingBatchAlreadyExists { mmr_id });
+            return Err(error);
         }
-
-        if !batch.staged_writes.is_empty() {
-            let (ords, kinds, indices, values) =
-                prepare_pending_entries(mmr_id, &batch.staged_writes)?;
-
-            sqlx::query(&entries_query)
-                .bind(mmr_id_pg)
-                .bind(&ords)
-                .bind(&kinds)
-                .bind(&indices)
-                .bind(&values)
-                .execute(&mut *tx)
-                .await?;
-        }
-
         tx.commit().await?;
         Ok(())
     }
@@ -519,82 +614,16 @@ impl Store for PostgresStore {
         &self,
         mmr_id: MmrId,
     ) -> Result<Option<BatchAppendResult>, StoreError> {
-        let mmr_id_pg = to_pg_mmr_id(mmr_id)?;
-        let batch_query = format!("{} FOR UPDATE", self.get_pending_batch_query());
-        let entries_query = self.get_pending_entries_query();
-        let delete_query = self.delete_pending_batch_query();
         let mut tx = self.pool.begin().await?;
-
-        let row = sqlx::query(&batch_query)
-            .bind(mmr_id_pg)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let Some(row) = row else {
-            tx.rollback().await?;
-            return Ok(None);
-        };
-
-        let result = decode_pending_batch_result(&row)?;
-        let expected_elements_count =
-            result.first_element_index.checked_sub(1).ok_or_else(|| {
-                StoreError::Internal(format!(
-                    "invalid pending batch first_element_index 0 for mmr_id {mmr_id}"
-                ))
-            })?;
-
-        let rows = sqlx::query(&entries_query)
-            .bind(mmr_id_pg)
-            .fetch_all(&mut *tx)
-            .await?;
-        let mut staged_writes = Vec::with_capacity(rows.len());
-        for row in rows {
-            let kind = kind_from_i16(row.try_get::<i16, _>("kind")?)?;
-            let idx = to_u64(row.try_get::<i64, _>("idx")?, "idx")?;
-            let key = StoreKey::new(mmr_id, kind, idx);
-            let value_bytes: Vec<u8> = row.try_get("value")?;
-            let value = decode_store_value(&key, &value_bytes)?;
-            staged_writes.push((key, value));
-        }
-
-        let elements_query = format!(
-            "SELECT value
-            FROM {}
-            WHERE mmr_id = $1
-              AND kind = $2
-              AND idx = 0
-            FOR UPDATE",
-            self.table_name
-        );
-        let elements_key = StoreKey::metadata(mmr_id, KeyKind::ElementsCount);
-        let elements_row = sqlx::query(&elements_query)
-            .bind(mmr_id_pg)
-            .bind(kind_to_i16(KeyKind::ElementsCount))
-            .fetch_optional(&mut *tx)
-            .await?;
-        let actual_elements_count = match elements_row {
-            Some(row) => {
-                let value: Vec<u8> = row.try_get("value")?;
-                decode_store_value(&elements_key, &value)?.expect_u64(&elements_key)?
+        let result = match self.commit_pending_batch_in_tx(&mut tx, mmr_id).await {
+            Ok(result) => result,
+            Err(error) => {
+                tx.rollback().await?;
+                return Err(error);
             }
-            None => 0,
         };
-        if actual_elements_count != expected_elements_count {
-            tx.rollback().await?;
-            return Err(StoreError::PendingBatchBaseMismatch {
-                mmr_id,
-                expected_elements_count,
-                actual_elements_count,
-            });
-        }
-
-        self.set_many_in_tx(&mut tx, staged_writes).await?;
-        sqlx::query(&delete_query)
-            .bind(mmr_id_pg)
-            .execute(&mut *tx)
-            .await?;
         tx.commit().await?;
-
-        Ok(Some(result))
+        Ok(result)
     }
 
     async fn delete_pending_batch(&self, mmr_id: MmrId) -> Result<(), StoreError> {
@@ -603,13 +632,19 @@ impl Store for PostgresStore {
     }
 
     async fn delete_pending_batch_if_exists(&self, mmr_id: MmrId) -> Result<bool, StoreError> {
-        let mmr_id_pg = to_pg_mmr_id(mmr_id)?;
-        let query = self.delete_pending_batch_query();
-        let outcome = sqlx::query(&query)
-            .bind(mmr_id_pg)
-            .execute(&self.pool)
-            .await?;
-        Ok(outcome.rows_affected() > 0)
+        let mut tx = self.pool.begin().await?;
+        let result = match self
+            .delete_pending_batch_if_exists_in_tx(&mut tx, mmr_id)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tx.rollback().await?;
+                return Err(error);
+            }
+        };
+        tx.commit().await?;
+        Ok(result)
     }
 
     async fn has_pending_batch(&self, mmr_id: MmrId) -> Result<bool, StoreError> {
@@ -657,6 +692,17 @@ fn decode_pending_batch_result(row: &PgRow) -> Result<BatchAppendResult, StoreEr
         elements_count,
         root_hash,
         peaks_hashes,
+    })
+}
+
+fn expected_pending_batch_elements_count(
+    mmr_id: MmrId,
+    first_element_index: u64,
+) -> Result<u64, StoreError> {
+    first_element_index.checked_sub(1).ok_or_else(|| {
+        StoreError::Internal(format!(
+            "invalid pending batch first_element_index 0 for mmr_id {mmr_id}"
+        ))
     })
 }
 

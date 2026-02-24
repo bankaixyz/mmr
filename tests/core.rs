@@ -931,6 +931,160 @@ async fn postgres_batch_append_in_tx_is_blocked_when_precommit_is_pending() {
 
 #[cfg(feature = "postgres-store")]
 #[tokio::test]
+async fn postgres_batch_precommit_in_tx_matches_non_tx_batch_precommit_output() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut non_tx = new_postgres_mmr(store.clone(), hasher.clone());
+    let mut in_tx = new_postgres_mmr(store.clone(), hasher);
+
+    for leaf in ["1", "2", "3", "4", "5"] {
+        non_tx.append(lv(leaf)).await.unwrap();
+        in_tx.append(lv(leaf)).await.unwrap();
+    }
+
+    let values = [lv("6"), lv("7"), lv("8")];
+    let expected = non_tx.batch_precommit_append(&values).await.unwrap();
+
+    let mut tx = store.begin_write_tx().await.unwrap();
+    let actual = in_tx
+        .batch_precommit_append_in_tx(&mut tx, &values)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(actual, expected);
+}
+
+#[cfg(feature = "postgres-store")]
+#[tokio::test]
+async fn postgres_batch_append_in_tx_is_blocked_by_pending_created_in_same_tx() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
+    let mut mmr = new_postgres_mmr(store.clone(), Arc::new(KeccakHasher::new()));
+
+    let mut tx = store.begin_write_tx().await.unwrap();
+    mmr.batch_precommit_append_in_tx(&mut tx, &[lv("1")])
+        .await
+        .unwrap();
+    assert!(matches!(
+        mmr.batch_append_in_tx(&mut tx, &[lv("2")]).await,
+        Err(MmrError::AppendBlockedByPendingPrecommit)
+    ));
+    tx.rollback().await.unwrap();
+}
+
+#[cfg(feature = "postgres-store")]
+#[tokio::test]
+async fn postgres_commit_precommit_in_tx_promotes_state_after_outer_commit() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = new_postgres_mmr(store.clone(), hasher.clone());
+
+    for leaf in ["1", "2", "3", "4", "5"] {
+        mmr.append(lv(leaf)).await.unwrap();
+    }
+
+    let mut tx = store.begin_write_tx().await.unwrap();
+    let staged = mmr
+        .batch_precommit_append_in_tx(&mut tx, &[lv("6"), lv("7"), lv("8")])
+        .await
+        .unwrap();
+    let committed = mmr.commit_precommit_in_tx(&mut tx).await.unwrap();
+    assert_eq!(committed, staged);
+    tx.commit().await.unwrap();
+
+    assert_eq!(mmr.get_elements_count().await.unwrap(), committed.elements_count);
+    assert_eq!(mmr.get_leaves_count().await.unwrap(), committed.leaves_count);
+    assert_eq!(mmr.get_root_hash().await.unwrap().unwrap(), committed.root_hash);
+    assert_eq!(mmr.get_peaks(None).await.unwrap(), committed.peaks_hashes);
+    assert!(!store.has_pending_batch(mmr.mmr_id).await.unwrap());
+}
+
+#[cfg(feature = "postgres-store")]
+#[tokio::test]
+async fn postgres_revert_precommit_in_tx_discards_pending_after_outer_commit() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
+    let mut mmr = new_postgres_mmr(store.clone(), Arc::new(KeccakHasher::new()));
+
+    for leaf in ["1", "2", "3", "4", "5"] {
+        mmr.append(lv(leaf)).await.unwrap();
+    }
+    let committed_elements = mmr.get_elements_count().await.unwrap();
+    let committed_leaves = mmr.get_leaves_count().await.unwrap();
+    let committed_root = mmr.get_root_hash().await.unwrap().unwrap();
+    let committed_peaks = mmr.get_peaks(None).await.unwrap();
+
+    let mut tx = store.begin_write_tx().await.unwrap();
+    mmr.batch_precommit_append_in_tx(&mut tx, &[lv("6"), lv("7"), lv("8")])
+        .await
+        .unwrap();
+    mmr.revert_precommit_in_tx(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(mmr.get_elements_count().await.unwrap(), committed_elements);
+    assert_eq!(mmr.get_leaves_count().await.unwrap(), committed_leaves);
+    assert_eq!(mmr.get_root_hash().await.unwrap().unwrap(), committed_root);
+    assert_eq!(mmr.get_peaks(None).await.unwrap(), committed_peaks);
+    assert!(!store.has_pending_batch(mmr.mmr_id).await.unwrap());
+}
+
+#[cfg(feature = "postgres-store")]
+#[tokio::test]
+async fn postgres_precommit_in_tx_is_discarded_on_outer_rollback() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
+    let mut mmr = new_postgres_mmr(store.clone(), Arc::new(KeccakHasher::new()));
+
+    mmr.append(lv("1")).await.unwrap();
+    let committed_elements = mmr.get_elements_count().await.unwrap();
+    let committed_leaves = mmr.get_leaves_count().await.unwrap();
+    let committed_root = mmr.get_root_hash().await.unwrap().unwrap();
+
+    let mut tx = store.begin_write_tx().await.unwrap();
+    mmr.precommit_append_in_tx(&mut tx, lv("2")).await.unwrap();
+    tx.rollback().await.unwrap();
+
+    assert_eq!(mmr.get_elements_count().await.unwrap(), committed_elements);
+    assert_eq!(mmr.get_leaves_count().await.unwrap(), committed_leaves);
+    assert_eq!(mmr.get_root_hash().await.unwrap().unwrap(), committed_root);
+    assert!(!store.has_pending_batch(mmr.mmr_id).await.unwrap());
+}
+
+#[cfg(feature = "postgres-store")]
+#[tokio::test]
+async fn postgres_commit_precommit_in_tx_returns_no_pending() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
+    let mut mmr = new_postgres_mmr(store.clone(), Arc::new(KeccakHasher::new()));
+
+    let mut tx = store.begin_write_tx().await.unwrap();
+    assert!(matches!(
+        mmr.commit_precommit_in_tx(&mut tx).await,
+        Err(MmrError::NoPendingPrecommit)
+    ));
+    tx.rollback().await.unwrap();
+}
+
+#[cfg(feature = "postgres-store")]
+#[tokio::test]
+async fn postgres_revert_precommit_in_tx_returns_no_pending() {
+    let fixture = PostgresFixture::start().await;
+    let store = fixture.store.clone();
+    let mut mmr = new_postgres_mmr(store.clone(), Arc::new(KeccakHasher::new()));
+
+    let mut tx = store.begin_write_tx().await.unwrap();
+    assert!(matches!(
+        mmr.revert_precommit_in_tx(&mut tx).await,
+        Err(MmrError::NoPendingPrecommit)
+    ));
+    tx.rollback().await.unwrap();
+}
+
+#[cfg(feature = "postgres-store")]
+#[tokio::test]
 async fn postgres_append_in_tx_commit_persists_write() {
     let fixture = PostgresFixture::start().await;
     let store = fixture.store.clone();

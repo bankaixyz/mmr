@@ -637,6 +637,20 @@ impl Mmr<Arc<PostgresStore>> {
         })
     }
 
+    pub async fn precommit_append_in_tx(
+        &mut self,
+        tx: &mut Transaction<'_, Postgres>,
+        value: Hash32,
+    ) -> Result<AppendResult, MmrError> {
+        let batch_result = self.batch_precommit_append_in_tx(tx, &[value]).await?;
+        Ok(AppendResult {
+            leaves_count: batch_result.leaves_count,
+            elements_count: batch_result.elements_count,
+            element_index: batch_result.first_element_index,
+            root_hash: batch_result.root_hash,
+        })
+    }
+
     pub async fn batch_append_in_tx(
         &mut self,
         tx: &mut Transaction<'_, Postgres>,
@@ -660,6 +674,68 @@ impl Mmr<Arc<PostgresStore>> {
         self.cached_counts = None;
 
         Ok(result)
+    }
+
+    pub async fn batch_precommit_append_in_tx(
+        &mut self,
+        tx: &mut Transaction<'_, Postgres>,
+        values: &[Hash32],
+    ) -> Result<BatchAppendResult, MmrError> {
+        if values.is_empty() {
+            return Err(MmrError::EmptyBatchAppend);
+        }
+        if self.store.has_pending_batch_in_tx(tx, self.mmr_id).await? {
+            return Err(MmrError::PrecommitAlreadyPending);
+        }
+
+        self.cached_counts = None;
+        let append_state = self.prepare_append_state_in_tx(tx).await?;
+        let AppendComputation {
+            staged_writes,
+            result,
+        } = self.build_append_writes(values, append_state)?;
+        let pending_batch = PendingBatch {
+            staged_writes,
+            result: result.clone(),
+        };
+
+        self.store
+            .create_pending_batch_in_tx(tx, self.mmr_id, pending_batch)
+            .await
+            .map_err(Self::map_precommit_store_error)?;
+
+        Ok(result)
+    }
+
+    pub async fn commit_precommit_in_tx(
+        &mut self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<BatchAppendResult, MmrError> {
+        let result = self
+            .store
+            .commit_pending_batch_in_tx(tx, self.mmr_id)
+            .await
+            .map_err(Self::map_precommit_store_error)?
+            .ok_or(MmrError::NoPendingPrecommit)?;
+        self.cached_counts = Some(CachedCounts {
+            leaves_count: result.leaves_count,
+            elements_count: result.elements_count,
+        });
+        Ok(result)
+    }
+
+    pub async fn revert_precommit_in_tx(
+        &mut self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), MmrError> {
+        if !self
+            .store
+            .delete_pending_batch_if_exists_in_tx(tx, self.mmr_id)
+            .await?
+        {
+            return Err(MmrError::NoPendingPrecommit);
+        }
+        Ok(())
     }
 
     async fn prepare_append_state_in_tx(
