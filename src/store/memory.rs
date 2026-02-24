@@ -2,17 +2,50 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::error::StoreError;
+use crate::types::MmrId;
 
-use super::{Store, StoreKey, StoreValue};
+use super::{KeyKind, PendingBatch, Store, StoreKey, StoreValue};
+
+#[derive(Debug, Default)]
+struct MemoryState {
+    entries: HashMap<StoreKey, StoreValue>,
+    pending_batches: HashMap<MmrId, PendingBatch>,
+}
 
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
-    inner: RwLock<HashMap<StoreKey, StoreValue>>,
+    inner: RwLock<MemoryState>,
 }
 
 impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn current_elements_count(state: &MemoryState, mmr_id: MmrId) -> Result<u64, StoreError> {
+        let key = StoreKey::metadata(mmr_id, KeyKind::ElementsCount);
+        match state.entries.get(&key) {
+            Some(StoreValue::U64(value)) => Ok(*value),
+            Some(other) => Err(StoreError::TypeMismatch {
+                key,
+                expected: "u64",
+                actual: other.clone(),
+            }),
+            None => Ok(0),
+        }
+    }
+
+    fn expected_elements_count(batch: &PendingBatch) -> Result<u64, StoreError> {
+        batch
+            .result
+            .first_element_index
+            .checked_sub(1)
+            .ok_or_else(|| {
+                StoreError::Internal(
+                    "pending batch has invalid first_element_index 0 while deriving expected base"
+                        .to_string(),
+                )
+            })
     }
 }
 
@@ -22,7 +55,7 @@ impl Store for InMemoryStore {
             .inner
             .read()
             .map_err(|_| StoreError::Internal("rwlock poisoned (read)".to_string()))?;
-        Ok(guard.get(key).cloned())
+        Ok(guard.entries.get(key).cloned())
     }
 
     async fn set(&self, key: StoreKey, value: StoreValue) -> Result<(), StoreError> {
@@ -30,7 +63,7 @@ impl Store for InMemoryStore {
             .inner
             .write()
             .map_err(|_| StoreError::Internal("rwlock poisoned (write)".to_string()))?;
-        guard.insert(key, value);
+        guard.entries.insert(key, value);
         Ok(())
     }
 
@@ -41,7 +74,7 @@ impl Store for InMemoryStore {
             .map_err(|_| StoreError::Internal("rwlock poisoned (write)".to_string()))?;
 
         for (key, value) in entries {
-            guard.insert(key, value);
+            guard.entries.insert(key, value);
         }
 
         Ok(())
@@ -52,7 +85,81 @@ impl Store for InMemoryStore {
             .inner
             .read()
             .map_err(|_| StoreError::Internal("rwlock poisoned (read)".to_string()))?;
-        Ok(keys.iter().map(|key| guard.get(key).cloned()).collect())
+        Ok(keys
+            .iter()
+            .map(|key| guard.entries.get(key).cloned())
+            .collect())
+    }
+
+    async fn create_pending_batch(
+        &self,
+        mmr_id: MmrId,
+        batch: PendingBatch,
+    ) -> Result<(), StoreError> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| StoreError::Internal("rwlock poisoned (write)".to_string()))?;
+
+        let expected_elements_count = Self::expected_elements_count(&batch)?;
+        let actual_elements_count = Self::current_elements_count(&guard, mmr_id)?;
+        if expected_elements_count != actual_elements_count {
+            return Err(StoreError::PendingBatchBaseMismatch {
+                mmr_id,
+                expected_elements_count,
+                actual_elements_count,
+            });
+        }
+
+        guard.pending_batches.insert(mmr_id, batch);
+        Ok(())
+    }
+
+    async fn has_pending_batch(&self, mmr_id: MmrId) -> Result<bool, StoreError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| StoreError::Internal("rwlock poisoned (read)".to_string()))?;
+        Ok(guard.pending_batches.contains_key(&mmr_id))
+    }
+
+    async fn commit_pending_batch(
+        &self,
+        mmr_id: MmrId,
+    ) -> Result<Option<crate::types::BatchAppendResult>, StoreError> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| StoreError::Internal("rwlock poisoned (write)".to_string()))?;
+
+        let Some(batch) = guard.pending_batches.get(&mmr_id).cloned() else {
+            return Ok(None);
+        };
+
+        let expected_elements_count = Self::expected_elements_count(&batch)?;
+        let actual_elements_count = Self::current_elements_count(&guard, mmr_id)?;
+        if expected_elements_count != actual_elements_count {
+            return Err(StoreError::PendingBatchBaseMismatch {
+                mmr_id,
+                expected_elements_count,
+                actual_elements_count,
+            });
+        }
+
+        for (key, value) in &batch.staged_writes {
+            guard.entries.insert(key.clone(), value.clone());
+        }
+        guard.pending_batches.remove(&mmr_id);
+
+        Ok(Some(batch.result))
+    }
+
+    async fn delete_pending_batch_if_exists(&self, mmr_id: MmrId) -> Result<bool, StoreError> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| StoreError::Internal("rwlock poisoned (write)".to_string()))?;
+        Ok(guard.pending_batches.remove(&mmr_id).is_some())
     }
 }
 
@@ -72,75 +179,6 @@ mod tests {
             (
                 StoreKey::new(1, KeyKind::NodeHash, 10),
                 StoreValue::Hash([3u8; 32]),
-
-    async fn commit_pending_batch(
-        &self,
-        mmr_id: MmrId,
-    ) -> Result<Option<PendingBatch>, StoreError> {
-        let pending = self
-            .pending_batches
-            .read()
-            .map_err(|_| StoreError::Internal("rwlock poisoned (read)".to_string()))?
-            .get(&mmr_id)
-            .cloned();
-
-        let Some(batch) = pending else {
-            return Ok(None);
-        };
-
-        let leaf_key = StoreKey::metadata(mmr_id, super::KeyKind::LeafCount);
-        let elements_key = StoreKey::metadata(mmr_id, super::KeyKind::ElementsCount);
-        let mut inner_guard = self
-            .inner
-            .write()
-            .map_err(|_| StoreError::Internal("rwlock poisoned (write)".to_string()))?;
-        let current_leaves = match inner_guard.get(&leaf_key) {
-            Some(StoreValue::U64(value)) => *value,
-            Some(other) => {
-                return Err(StoreError::TypeMismatch {
-                    key: leaf_key,
-                    expected: "u64",
-                    actual: other.clone(),
-                });
-            }
-            None => 0,
-        };
-        let current_elements = match inner_guard.get(&elements_key) {
-            Some(StoreValue::U64(value)) => *value,
-            Some(other) => {
-                return Err(StoreError::TypeMismatch {
-                    key: elements_key,
-                    expected: "u64",
-                    actual: other.clone(),
-                });
-            }
-            None => 0,
-        };
-        if current_leaves != batch.base_leaves_count
-            || current_elements != batch.base_elements_count
-        {
-            return Err(StoreError::PendingBatchBaseStateChanged { mmr_id });
-        }
-
-        for (key, value) in &batch.staged_writes {
-            inner_guard.insert(key.clone(), value.clone());
-        }
-
-        self.pending_batches
-            .write()
-            .map_err(|_| StoreError::Internal("rwlock poisoned (write)".to_string()))?
-            .remove(&mmr_id);
-
-        Ok(Some(batch))
-    }
-
-    async fn remove_pending_batch(&self, mmr_id: MmrId) -> Result<bool, StoreError> {
-        let mut guard = self
-            .pending_batches
-            .write()
-            .map_err(|_| StoreError::Internal("rwlock poisoned (write)".to_string()))?;
-        Ok(guard.remove(&mmr_id).is_some())
-    }
             ),
         ];
 
@@ -169,24 +207,3 @@ mod tests {
         );
     }
 }
-            base_leaves_count: 0,
-            base_elements_count: 0,
-            store
-                .create_pending_batch(
-                    mmr_id,
-                    PendingBatch {
-                        base_leaves_count: 0,
-                        base_elements_count: 0,
-                        staged_writes: Vec::new(),
-                        result: BatchAppendResult {
-                            appended_count: 0,
-                            first_element_index: 0,
-                            last_element_index: 0,
-                            leaves_count: 0,
-                            elements_count: 0,
-                            root_hash: [0u8; 32],
-                            peaks_hashes: Vec::new(),
-                        },
-                    }
-                )
-                .await,

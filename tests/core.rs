@@ -280,14 +280,90 @@ async fn batch_append_rejects_empty_values() {
 }
 
 #[tokio::test]
-    mmr.batch_precommit_append(&[lv("1"), lv("2")])
+async fn commit_precommit_fails_if_base_state_changed_and_does_not_apply_staged_writes() {
+    let store = Arc::new(InMemoryStore::default());
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store.clone(), hasher, Some(210)).unwrap();
+
+    mmr.append(lv("1")).await.unwrap();
+    let precommit_result = mmr
+        .batch_precommit_append(&[lv("2"), lv("3")])
         .await
         .unwrap();
+
+    store
+        .set(
+            StoreKey::metadata(210, KeyKind::ElementsCount),
+            StoreValue::U64(99),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        mmr.commit_precommit().await,
+        Err(MmrError::PrecommitBaseStateChanged)
+    ));
+
+    let first_pending_node =
+        StoreKey::new(210, KeyKind::NodeHash, precommit_result.first_element_index);
+    assert!(store.get(&first_pending_node).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn commit_precommit_mismatch_keeps_pending_batch() {
+    let store = Arc::new(InMemoryStore::default());
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store.clone(), hasher, Some(211)).unwrap();
+
+    mmr.append(lv("1")).await.unwrap();
+    let precommit_result = mmr.batch_precommit_append(&[lv("2")]).await.unwrap();
+
+    store
+        .set(
+            StoreKey::metadata(211, KeyKind::ElementsCount),
+            StoreValue::U64(99),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        mmr.commit_precommit().await,
+        Err(MmrError::PrecommitBaseStateChanged)
+    ));
+
+    store
+        .set(
+            StoreKey::metadata(211, KeyKind::ElementsCount),
+            StoreValue::U64(1),
+        )
+        .await
+        .unwrap();
+
+    let committed = mmr.commit_precommit().await.unwrap();
+    assert_eq!(committed, precommit_result);
+}
+
+#[tokio::test]
+async fn revert_precommit_is_single_step() {
+    let store = Arc::new(InMemoryStore::default());
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store, hasher, Some(212)).unwrap();
+
+    mmr.append(lv("1")).await.unwrap();
+    mmr.batch_precommit_append(&[lv("2")]).await.unwrap();
+
+    mmr.revert_precommit().await.unwrap();
+    assert!(matches!(
+        mmr.revert_precommit().await,
+        Err(MmrError::NoPendingPrecommit)
+    ));
+}
+
+#[tokio::test]
+async fn should_create_from_peaks_and_match_followup_appends() {
     let hasher = Arc::new(KeccakHasher::new());
 
-    mmr.batch_precommit_append(&[lv("2"), lv("3")])
-        .await
-        .unwrap();
+    let store1 = Arc::new(InMemoryStore::default());
     let mut original = Mmr::new(store1.clone(), hasher.clone(), Some(11)).unwrap();
 
     let mut original_appends = Vec::new();
@@ -336,41 +412,9 @@ async fn batch_append_rejects_empty_values() {
         new_appends_peaks.push(from_peaks.append(lv(element)).await.unwrap());
     }
 
-    assert_eq!(
-        mmr.get_elements_count().await.unwrap(),
-        commit_result.elements_count
-    );
-    assert_eq!(
-        mmr.get_leaves_count().await.unwrap(),
-        commit_result.leaves_count
-    );
-    assert_eq!(
-        mmr.get_peaks(None).await.unwrap(),
-        commit_result.peaks_hashes
-    );
-#[tokio::test]
-async fn commit_precommit_fails_if_base_state_changed() {
-    let store = Arc::new(InMemoryStore::default());
-    let hasher = Arc::new(KeccakHasher::new());
-    let mut mmr = Mmr::new(store.clone(), hasher, Some(210)).unwrap();
+    assert_eq!(new_appends_orig, new_appends_peaks);
 
-    mmr.append(lv("1")).await.unwrap();
-    mmr.batch_precommit_append(&[lv("2")]).await.unwrap();
-
-    store
-        .set(
-            StoreKey::metadata(210, KeyKind::ElementsCount),
-            StoreValue::U64(99),
-        )
-        .await
-        .unwrap();
-
-    assert!(matches!(
-        mmr.commit_precommit().await,
-        Err(MmrError::PrecommitBaseStateChanged)
-    ));
-}
-
+    let final_elements_count = original.get_elements_count().await.unwrap();
     let final_leaves_count = original.get_leaves_count().await.unwrap();
     let final_peaks = original.get_peaks(None).await.unwrap();
     let final_bag = original.bag_the_peaks(None).await.unwrap();
@@ -431,6 +475,38 @@ async fn commit_precommit_fails_if_base_state_changed() {
     }
 }
 
+#[cfg(feature = "postgres-store")]
+#[tokio::test]
+async fn postgres_batch_append_in_tx_is_blocked_by_pending_precommit() {
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => return,
+    };
+
+    let store = Arc::new(
+        PostgresStore::connect_with_options(
+            &database_url,
+            PostgresStoreOptions {
+                initialize_schema: true,
+                max_connections: 2,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(store.clone(), hasher, Some(unique_test_mmr_id())).unwrap();
+
+    mmr.batch_precommit_append(&[lv("1")]).await.unwrap();
+
+    let mut tx = store.begin_write_tx().await.unwrap();
+    assert!(matches!(
+        mmr.batch_append_in_tx(&mut tx, &[lv("2")]).await,
+        Err(MmrError::AppendBlockedByPendingPrecommit)
+    ));
+    tx.rollback().await.unwrap();
+}
+
 #[tokio::test]
 async fn should_handle_create_from_peaks_edge_cases() {
     let hasher = Arc::new(KeccakHasher::new());
@@ -453,11 +529,7 @@ async fn should_handle_create_from_peaks_edge_cases() {
     .await;
     assert!(matches!(
         invalid_peaks,
-    assert!(
-        base_peaks
-            .iter()
-            .any(|peak| precommit_result.peaks_hashes.contains(peak))
-    );
+        Err(MmrError::InvalidPeaksCountForElements)
     ));
 
     let mut zero_mmr = Mmr::create_from_peaks(
@@ -674,10 +746,7 @@ async fn append_uses_one_get_many_and_one_set_many_in_steady_state() {
     let after = store.metrics();
 
     assert_eq!(after.get_many_calls - before.get_many_calls, 1);
-        .set(
-            StoreKey::new(mmr_id, KeyKind::NodeHash, 7),
-            StoreValue::Hash(lv("7")),
-        )
+    assert_eq!(after.set_many_calls - before.set_many_calls, 1);
     assert_eq!(after.get_calls - before.get_calls, 0);
     assert_eq!(after.set_calls - before.set_calls, 0);
 }
@@ -765,11 +834,7 @@ async fn postgres_batch_append_in_tx_rollback_leaves_store_unchanged() {
     let mut tx = store.begin_write_tx().await.unwrap();
     let result = mmr
         .batch_append_in_tx(&mut tx, &[lv("1"), lv("2"), lv("3")])
-    assert!(
-        !mmr.verify_proof(&tampered_peaks, lv("1"), None)
-            .await
-            .unwrap()
-    );
+        .await
         .unwrap();
     assert_eq!(result.appended_count, 3);
     assert!(!result.peaks_hashes.is_empty());
@@ -856,11 +921,7 @@ async fn postgres_append_in_tx_commit_persists_write() {
 
     let mut tx = store.begin_write_tx().await.unwrap();
     let append = mmr.append_in_tx(&mut tx, lv("10")).await.unwrap();
-        self.inner
-            .lock()
-            .unwrap()
-            .keys()
-            .any(|key| key.mmr_id == mmr_id)
+    tx.commit().await.unwrap();
 
     assert_eq!(append.element_index, 1);
     assert_eq!(mmr.get_elements_count().await.unwrap(), 1);
@@ -930,5 +991,3 @@ async fn postgres_multiple_appends_in_same_tx_are_composable() {
             .unwrap()
     );
 }
-    let result =
-        Mmr::create_from_peaks(store.clone(), hasher, Some(mmr_id), vec![lv("1")], 1).await;

@@ -5,13 +5,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "postgres-store")]
 use sqlx::{Postgres, Transaction};
 
-use crate::error::MmrError;
+use crate::error::{MmrError, StoreError};
 use crate::hasher::Hasher;
 #[cfg(feature = "postgres-store")]
 use crate::store::PostgresStore;
-    element_index_to_leaf_index, elements_count_to_leaf_count, find_peaks, find_siblings,
-    get_peak_info, leaf_count_to_append_no_merges, leaf_count_to_peaks_count,
-    mmr_size_to_leaf_count,
+use crate::store::{KeyKind, PendingBatch, Store, StoreKey, StoreValue};
+use crate::types::{
     AppendResult, BatchAppendResult, ElementIndex, Hash32, MmrId, Proof, ZERO_HASH,
 };
 
@@ -105,6 +104,7 @@ impl<S: Store> Mmr<S> {
         if values.is_empty() {
             return Err(MmrError::EmptyBatchAppend);
         }
+        self.ensure_no_pending_precommit().await?;
 
         let append_state = self.prepare_append_state().await?;
         let AppendComputation {
@@ -121,23 +121,79 @@ impl<S: Store> Mmr<S> {
         Ok(result)
     }
 
-    pub async fn get_proof(
-        let base_leaves_count = append_state.leaves_count;
-        let base_elements_count = append_state.elements_count;
-            base_leaves_count,
-            base_elements_count,
-        let pending = match self.store.commit_pending_batch(self.mmr_id).await {
-            Ok(Some(pending)) => pending,
-            Ok(None) => return Err(MmrError::NoPendingPrecommit),
-            Err(error) => {
-                if Self::is_pending_batch_base_changed_error(&error) {
-                    return Err(MmrError::PrecommitBaseStateChanged);
-                }
-                return Err(MmrError::from(error));
-            }
+    pub async fn batch_precommit_append(
+        &mut self,
+        values: &[Hash32],
+    ) -> Result<BatchAppendResult, MmrError> {
+        if values.is_empty() {
+            return Err(MmrError::EmptyBatchAppend);
+        }
+        self.ensure_no_pending_precommit().await?;
+
+        let append_state = self.prepare_append_state().await?;
+        let AppendComputation {
+            staged_writes,
+            result,
+        } = self.build_append_writes(values, append_state)?;
+
+        self.store
+            .create_pending_batch(
+                self.mmr_id,
+                PendingBatch {
+                    staged_writes,
+                    result: result.clone(),
+                },
+            )
+            .await
+            .map_err(Self::map_precommit_store_error)?;
+
+        Ok(result)
+    }
+
+    pub async fn commit_precommit(&mut self) -> Result<BatchAppendResult, MmrError> {
+        let maybe_result = self
+            .store
+            .commit_pending_batch(self.mmr_id)
+            .await
+            .map_err(Self::map_precommit_store_error)?;
+
+        let Some(result) = maybe_result else {
+            return Err(MmrError::NoPendingPrecommit);
         };
-        let PendingBatch { result, .. } = pending;
-        if !self.store.remove_pending_batch(self.mmr_id).await? {
+
+        self.cached_counts = Some(CachedCounts {
+            leaves_count: result.leaves_count,
+            elements_count: result.elements_count,
+        });
+        Ok(result)
+    }
+
+    pub async fn revert_precommit(&self) -> Result<(), MmrError> {
+        if !self
+            .store
+            .delete_pending_batch_if_exists(self.mmr_id)
+            .await?
+        {
+            return Err(MmrError::NoPendingPrecommit);
+        }
+        Ok(())
+    }
+
+    pub async fn get_proof(
+        &self,
+        element_index: ElementIndex,
+        elements_count: Option<u64>,
+    ) -> Result<Proof, MmrError> {
+        if element_index == 0 {
+            return Err(MmrError::InvalidElementIndex);
+        }
+
+        let tree_size = match elements_count {
+            Some(count) => count,
+            None => self.get_elements_count().await?,
+        };
+
+        if element_index > tree_size {
             return Err(MmrError::InvalidElementIndex);
         }
 
@@ -358,6 +414,20 @@ impl<S: Store> Mmr<S> {
         Ok(append_state)
     }
 
+    fn map_precommit_store_error(error: StoreError) -> MmrError {
+        match error {
+            StoreError::PendingBatchBaseMismatch { .. } => MmrError::PrecommitBaseStateChanged,
+            other => MmrError::Store(other),
+        }
+    }
+
+    async fn ensure_no_pending_precommit(&self) -> Result<(), MmrError> {
+        if self.store.has_pending_batch(self.mmr_id).await? {
+            return Err(MmrError::AppendBlockedByPendingPrecommit);
+        }
+        Ok(())
+    }
+
     async fn load_cached_counts(&mut self) -> Result<CachedCounts, MmrError> {
         if let Some(cached_counts) = self.cached_counts {
             return Ok(cached_counts);
@@ -570,13 +640,6 @@ impl Mmr<Arc<PostgresStore>> {
         })
     }
 
-    fn is_pending_batch_base_changed_error(error: &crate::error::StoreError) -> bool {
-        matches!(
-            error,
-            crate::error::StoreError::PendingBatchBaseStateChanged { .. }
-        )
-    }
-
     pub async fn batch_append_in_tx(
         &mut self,
         tx: &mut Transaction<'_, Postgres>,
@@ -613,6 +676,10 @@ impl Mmr<Arc<PostgresStore>> {
         let elements_count =
             Self::extract_counter(&elements_count_key, values.get(1).cloned().flatten())?;
 
+        if self.store.has_pending_batch_in_tx(tx, self.mmr_id).await? {
+            return Err(MmrError::AppendBlockedByPendingPrecommit);
+        }
+
         if elements_count == 0 {
             return Ok(AppendState {
                 leaves_count,
@@ -637,9 +704,7 @@ impl Mmr<Arc<PostgresStore>> {
         keys.push(elements_count_key.clone());
         keys.extend(peak_indices.iter().map(|idx| self.node_key(*idx)));
 
-        if self.store.has_pending_batch_in_tx(tx, self.mmr_id).await? {
-            return Err(MmrError::AppendBlockedByPendingPrecommit);
-        }
+        let values = self.store.get_many_in_tx(tx, &keys).await?;
         let leaves_count =
             Self::extract_counter(&leaf_count_key, values.first().cloned().flatten())?;
         let elements_count =

@@ -1,4 +1,5 @@
 use crate::store::{StoreKey, StoreValue};
+use crate::types::MmrId;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -11,8 +12,14 @@ pub enum StoreError {
         expected: &'static str,
         actual: StoreValue,
     },
-    #[error("pending batch base state changed for mmr_id {mmr_id}")]
-    PendingBatchBaseStateChanged { mmr_id: MmrId },
+    #[error(
+        "pending batch base mismatch for mmr_id {mmr_id}: expected elements_count {expected_elements_count}, actual {actual_elements_count}"
+    )]
+    PendingBatchBaseMismatch {
+        mmr_id: MmrId,
+        expected_elements_count: u64,
+        actual_elements_count: u64,
+    },
     #[cfg(feature = "postgres-store")]
     #[error("sqlx error: {0}")]
     Sqlx(#[from] sqlx::Error),
@@ -53,6 +60,10 @@ pub enum MmrError {
     EmptyBatchAppend,
     #[error("cannot commit precommit: base state changed since precommit was created")]
     PrecommitBaseStateChanged,
+    #[error("cannot append while a pending precommit exists")]
+    AppendBlockedByPendingPrecommit,
+    #[error("no pending precommit")]
+    NoPendingPrecommit,
     #[error("no hash found for index {0}")]
     NoHashFoundForIndex(u64),
     #[error("arithmetic overflow")]
