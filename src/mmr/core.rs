@@ -9,8 +9,9 @@ use crate::error::MmrError;
 use crate::hasher::Hasher;
 #[cfg(feature = "postgres-store")]
 use crate::store::PostgresStore;
-use crate::store::{KeyKind, Store, StoreKey, StoreValue};
-use crate::types::{
+    element_index_to_leaf_index, elements_count_to_leaf_count, find_peaks, find_siblings,
+    get_peak_info, leaf_count_to_append_no_merges, leaf_count_to_peaks_count,
+    mmr_size_to_leaf_count,
     AppendResult, BatchAppendResult, ElementIndex, Hash32, MmrId, Proof, ZERO_HASH,
 };
 
@@ -121,20 +122,22 @@ impl<S: Store> Mmr<S> {
     }
 
     pub async fn get_proof(
-        &self,
-        element_index: ElementIndex,
-        elements_count: Option<u64>,
-    ) -> Result<Proof, MmrError> {
-        if element_index == 0 {
-            return Err(MmrError::InvalidElementIndex);
-        }
-
-        let tree_size = match elements_count {
-            Some(count) => count,
-            None => self.get_elements_count().await?,
+        let base_leaves_count = append_state.leaves_count;
+        let base_elements_count = append_state.elements_count;
+            base_leaves_count,
+            base_elements_count,
+        let pending = match self.store.commit_pending_batch(self.mmr_id).await {
+            Ok(Some(pending)) => pending,
+            Ok(None) => return Err(MmrError::NoPendingPrecommit),
+            Err(error) => {
+                if Self::is_pending_batch_base_changed_error(&error) {
+                    return Err(MmrError::PrecommitBaseStateChanged);
+                }
+                return Err(MmrError::from(error));
+            }
         };
-
-        if element_index > tree_size {
+        let PendingBatch { result, .. } = pending;
+        if !self.store.remove_pending_batch(self.mmr_id).await? {
             return Err(MmrError::InvalidElementIndex);
         }
 
@@ -567,6 +570,13 @@ impl Mmr<Arc<PostgresStore>> {
         })
     }
 
+    fn is_pending_batch_base_changed_error(error: &crate::error::StoreError) -> bool {
+        matches!(
+            error,
+            crate::error::StoreError::PendingBatchBaseStateChanged { .. }
+        )
+    }
+
     pub async fn batch_append_in_tx(
         &mut self,
         tx: &mut Transaction<'_, Postgres>,
@@ -627,7 +637,9 @@ impl Mmr<Arc<PostgresStore>> {
         keys.push(elements_count_key.clone());
         keys.extend(peak_indices.iter().map(|idx| self.node_key(*idx)));
 
-        let values = self.store.get_many_in_tx(tx, &keys).await?;
+        if self.store.has_pending_batch_in_tx(tx, self.mmr_id).await? {
+            return Err(MmrError::AppendBlockedByPendingPrecommit);
+        }
         let leaves_count =
             Self::extract_counter(&leaf_count_key, values.first().cloned().flatten())?;
         let elements_count =

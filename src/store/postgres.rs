@@ -66,6 +66,9 @@ impl PostgresStore {
         sqlx::query(&self.create_table_sql())
             .execute(&self.pool)
             .await?;
+        sqlx::query(&self.add_pending_base_columns_sql())
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
@@ -119,6 +122,20 @@ impl PostgresStore {
         decode_many_values(keys, rows)
     }
 
+    pub(crate) async fn has_pending_batch_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        mmr_id: MmrId,
+    ) -> Result<bool, StoreError> {
+        let mmr_id_pg = to_pg_mmr_id(mmr_id)?;
+        let query = self.has_pending_batch_query();
+        let row = sqlx::query(&query)
+            .bind(mmr_id_pg)
+            .fetch_optional(&mut **tx)
+            .await?;
+        Ok(row.is_some())
+    }
+
     fn create_table_sql(&self) -> String {
         format!(
             "CREATE TABLE IF NOT EXISTS {table} (
@@ -135,6 +152,18 @@ impl PostgresStore {
                 )
             );",
             table = self.table_name
+        )
+    }
+
+                base_leaves_count INT8 NOT NULL,
+                base_elements_count INT8 NOT NULL,
+    fn add_pending_base_columns_sql(&self) -> String {
+        let table = self.pending_batches_table_name();
+        format!(
+            "ALTER TABLE {table}
+             ADD COLUMN IF NOT EXISTS base_leaves_count INT8 NOT NULL DEFAULT 0,
+             ADD COLUMN IF NOT EXISTS base_elements_count INT8 NOT NULL DEFAULT 0;",
+            table = table
         )
     }
 
@@ -220,7 +249,29 @@ impl Store for PostgresStore {
         sqlx::query(&query)
             .bind(mmr_id)
             .bind(kind)
-            .bind(idx)
+                base_leaves_count,
+                base_elements_count,
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                base_leaves_count,
+                base_elements_count,
+    fn delete_pending_batch_returning_query(&self) -> String {
+        format!(
+            "DELETE FROM {table}
+            WHERE mmr_id = $1
+            RETURNING
+                base_leaves_count,
+                base_elements_count,
+                appended_count,
+                first_element_index,
+                last_element_index,
+                leaves_count,
+                elements_count,
+                root_hash,
+                peaks_hashes",
+            table = self.pending_batches_table_name()
+        )
+    }
+
             .bind(encoded)
             .execute(&self.pool)
             .await?;
@@ -373,9 +424,171 @@ fn decode_store_value(key: &StoreKey, bytes: &[u8]) -> Result<StoreValue, StoreE
                 )));
             }
             let mut out = [0u8; 32];
-            out.copy_from_slice(bytes);
-            Ok(StoreValue::Hash(out))
+        let base_leaves_count = to_pg_idx(batch.base_leaves_count)?;
+        let base_elements_count = to_pg_idx(batch.base_elements_count)?;
+            .bind(base_leaves_count)
+            .bind(base_elements_count)
+        let base_leaves_count = to_u64(
+            row.try_get::<i64, _>("base_leaves_count")?,
+            "base_leaves_count",
+        )?;
+        let base_elements_count = to_u64(
+            row.try_get::<i64, _>("base_elements_count")?,
+            "base_elements_count",
+        )?;
+        let first_element_index = to_u64(
+            row.try_get::<i64, _>("first_element_index")?,
+            "first_element_index",
+        )?;
+        let last_element_index = to_u64(
+            row.try_get::<i64, _>("last_element_index")?,
+            "last_element_index",
+        )?;
+            base_leaves_count,
+            base_elements_count,
+
+    async fn commit_pending_batch(
+        &self,
+        mmr_id: MmrId,
+    ) -> Result<Option<PendingBatch>, StoreError> {
+        let mmr_id_pg = to_pg_mmr_id(mmr_id)?;
+        let delete_batch_query = self.delete_pending_batch_returning_query();
+        let entries_query = self.get_pending_entries_query();
+        let counters_query = self.get_many_query();
+        let mut tx = self.pool.begin().await?;
+
+        let rows = sqlx::query(&entries_query)
+            .bind(mmr_id_pg)
+            .fetch_all(&mut *tx)
+            .await?;
+
+        let batch_row = sqlx::query(&delete_batch_query)
+            .bind(mmr_id_pg)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        let Some(batch_row) = batch_row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        let mut staged_writes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let kind = kind_from_i16(row.try_get::<i16, _>("kind")?)?;
+            let idx = to_u64(row.try_get::<i64, _>("idx")?, "idx")?;
+            let key = StoreKey::new(mmr_id, kind, idx);
+            let value_bytes: Vec<u8> = row.try_get("value")?;
+            let value = decode_store_value(&key, &value_bytes)?;
+            staged_writes.push((key, value));
         }
+
+        let base_leaves_count = to_u64(
+            batch_row.try_get::<i64, _>("base_leaves_count")?,
+            "base_leaves_count",
+        )?;
+        let base_elements_count = to_u64(
+            batch_row.try_get::<i64, _>("base_elements_count")?,
+            "base_elements_count",
+        )?;
+        let appended_count = to_u64(
+            batch_row.try_get::<i64, _>("appended_count")?,
+            "appended_count",
+        )?;
+        let first_element_index = to_u64(
+            batch_row.try_get::<i64, _>("first_element_index")?,
+            "first_element_index",
+        )?;
+        let last_element_index = to_u64(
+            batch_row.try_get::<i64, _>("last_element_index")?,
+            "last_element_index",
+        )?;
+        let leaves_count = to_u64(batch_row.try_get::<i64, _>("leaves_count")?, "leaves_count")?;
+        let elements_count = to_u64(
+            batch_row.try_get::<i64, _>("elements_count")?,
+            "elements_count",
+        )?;
+
+        let root_hash_bytes: Vec<u8> = batch_row.try_get("root_hash")?;
+        if root_hash_bytes.len() != 32 {
+            return Err(StoreError::Internal(format!(
+                "expected 32 bytes for pending root_hash, got {}",
+                root_hash_bytes.len()
+            )));
+        }
+        let mut root_hash = [0u8; 32];
+        root_hash.copy_from_slice(&root_hash_bytes);
+
+        let peaks_hashes_bytes: Vec<u8> = batch_row.try_get("peaks_hashes")?;
+        let peaks_hashes = decode_peaks_hashes(&peaks_hashes_bytes)?;
+
+        let counter_keys = [
+            StoreKey::metadata(mmr_id, KeyKind::LeafCount),
+            StoreKey::metadata(mmr_id, KeyKind::ElementsCount),
+        ];
+        let (counter_mmr_ids, counter_kinds, counter_indices) = prepare_keys(&counter_keys)?;
+        let counter_rows = sqlx::query(&counters_query)
+            .bind(&counter_mmr_ids)
+            .bind(&counter_kinds)
+            .bind(&counter_indices)
+            .fetch_all(&mut *tx)
+            .await?;
+        let counter_values = decode_many_values(&counter_keys, counter_rows)?;
+        let current_leaves_count = match counter_values.first().cloned().flatten() {
+            Some(StoreValue::U64(value)) => value,
+            Some(other) => {
+                return Err(StoreError::TypeMismatch {
+                    key: counter_keys[0].clone(),
+                    expected: "u64",
+                    actual: other,
+                });
+            }
+            None => 0,
+        };
+        let current_elements_count = match counter_values.get(1).cloned().flatten() {
+            Some(StoreValue::U64(value)) => value,
+            Some(other) => {
+                return Err(StoreError::TypeMismatch {
+                    key: counter_keys[1].clone(),
+                    expected: "u64",
+                    actual: other,
+                });
+            }
+            None => 0,
+        };
+        if current_leaves_count != base_leaves_count
+            || current_elements_count != base_elements_count
+        {
+            tx.rollback().await?;
+            return Err(StoreError::PendingBatchBaseStateChanged { mmr_id });
+        }
+
+        self.set_many_in_tx(&mut tx, staged_writes.clone()).await?;
+        tx.commit().await?;
+
+        Ok(Some(PendingBatch {
+            base_leaves_count,
+            base_elements_count,
+            staged_writes,
+            result: BatchAppendResult {
+                appended_count,
+                first_element_index,
+                last_element_index,
+                leaves_count,
+                elements_count,
+                root_hash,
+                peaks_hashes,
+            },
+        }))
+    }
+
+    async fn remove_pending_batch(&self, mmr_id: MmrId) -> Result<bool, StoreError> {
+        let mmr_id_pg = to_pg_mmr_id(mmr_id)?;
+        let query = self.delete_pending_batch_query();
+        let result = sqlx::query(&query)
+            .bind(mmr_id_pg)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
@@ -483,3 +696,5 @@ mod tests {
         drop(store);
     }
 }
+            base_leaves_count: 1024,
+            base_elements_count: 2048,

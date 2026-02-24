@@ -72,6 +72,75 @@ mod tests {
             (
                 StoreKey::new(1, KeyKind::NodeHash, 10),
                 StoreValue::Hash([3u8; 32]),
+
+    async fn commit_pending_batch(
+        &self,
+        mmr_id: MmrId,
+    ) -> Result<Option<PendingBatch>, StoreError> {
+        let pending = self
+            .pending_batches
+            .read()
+            .map_err(|_| StoreError::Internal("rwlock poisoned (read)".to_string()))?
+            .get(&mmr_id)
+            .cloned();
+
+        let Some(batch) = pending else {
+            return Ok(None);
+        };
+
+        let leaf_key = StoreKey::metadata(mmr_id, super::KeyKind::LeafCount);
+        let elements_key = StoreKey::metadata(mmr_id, super::KeyKind::ElementsCount);
+        let mut inner_guard = self
+            .inner
+            .write()
+            .map_err(|_| StoreError::Internal("rwlock poisoned (write)".to_string()))?;
+        let current_leaves = match inner_guard.get(&leaf_key) {
+            Some(StoreValue::U64(value)) => *value,
+            Some(other) => {
+                return Err(StoreError::TypeMismatch {
+                    key: leaf_key,
+                    expected: "u64",
+                    actual: other.clone(),
+                });
+            }
+            None => 0,
+        };
+        let current_elements = match inner_guard.get(&elements_key) {
+            Some(StoreValue::U64(value)) => *value,
+            Some(other) => {
+                return Err(StoreError::TypeMismatch {
+                    key: elements_key,
+                    expected: "u64",
+                    actual: other.clone(),
+                });
+            }
+            None => 0,
+        };
+        if current_leaves != batch.base_leaves_count
+            || current_elements != batch.base_elements_count
+        {
+            return Err(StoreError::PendingBatchBaseStateChanged { mmr_id });
+        }
+
+        for (key, value) in &batch.staged_writes {
+            inner_guard.insert(key.clone(), value.clone());
+        }
+
+        self.pending_batches
+            .write()
+            .map_err(|_| StoreError::Internal("rwlock poisoned (write)".to_string()))?
+            .remove(&mmr_id);
+
+        Ok(Some(batch))
+    }
+
+    async fn remove_pending_batch(&self, mmr_id: MmrId) -> Result<bool, StoreError> {
+        let mut guard = self
+            .pending_batches
+            .write()
+            .map_err(|_| StoreError::Internal("rwlock poisoned (write)".to_string()))?;
+        Ok(guard.remove(&mmr_id).is_some())
+    }
             ),
         ];
 
@@ -100,3 +169,24 @@ mod tests {
         );
     }
 }
+            base_leaves_count: 0,
+            base_elements_count: 0,
+            store
+                .create_pending_batch(
+                    mmr_id,
+                    PendingBatch {
+                        base_leaves_count: 0,
+                        base_elements_count: 0,
+                        staged_writes: Vec::new(),
+                        result: BatchAppendResult {
+                            appended_count: 0,
+                            first_element_index: 0,
+                            last_element_index: 0,
+                            leaves_count: 0,
+                            elements_count: 0,
+                            root_hash: [0u8; 32],
+                            peaks_hashes: Vec::new(),
+                        },
+                    }
+                )
+                .await,

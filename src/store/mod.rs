@@ -12,6 +12,8 @@ pub use memory::InMemoryStore;
 #[cfg(feature = "postgres-store")]
 pub use postgres::{PostgresStore, PostgresStoreOptions};
 
+    pub base_leaves_count: u64,
+    pub base_elements_count: u64,
 #[allow(async_fn_in_trait)]
 pub trait Store: Send + Sync {
     async fn get(&self, key: &StoreKey) -> Result<Option<StoreValue>, StoreError>;
@@ -24,6 +26,19 @@ pub trait Store: Send + Sync {
         Ok(())
     }
     async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError>;
+    async fn commit_pending_batch(
+        &self,
+        _mmr_id: MmrId,
+    ) -> Result<Option<PendingBatch>, StoreError> {
+        Err(StoreError::Internal(
+            "pending batches are not supported by this store backend".to_string(),
+        ))
+    }
+    async fn remove_pending_batch(&self, _mmr_id: MmrId) -> Result<bool, StoreError> {
+        Err(StoreError::Internal(
+            "pending batches are not supported by this store backend".to_string(),
+        ))
+    }
 }
 
 impl<T: Store + ?Sized> Store for Arc<T> {
@@ -41,6 +56,17 @@ impl<T: Store + ?Sized> Store for Arc<T> {
 
     async fn get_many(&self, keys: &[StoreKey]) -> Result<Vec<Option<StoreValue>>, StoreError> {
         (**self).get_many(keys).await
+    }
+
+    async fn commit_pending_batch(
+        &self,
+        mmr_id: MmrId,
+    ) -> Result<Option<PendingBatch>, StoreError> {
+        (**self).commit_pending_batch(mmr_id).await
+    }
+
+    async fn remove_pending_batch(&self, mmr_id: MmrId) -> Result<bool, StoreError> {
+        (**self).remove_pending_batch(mmr_id).await
     }
 }
 

@@ -11,6 +11,8 @@ pub enum StoreError {
         expected: &'static str,
         actual: StoreValue,
     },
+    #[error("pending batch base state changed for mmr_id {mmr_id}")]
+    PendingBatchBaseStateChanged { mmr_id: MmrId },
     #[cfg(feature = "postgres-store")]
     #[error("sqlx error: {0}")]
     Sqlx(#[from] sqlx::Error),
@@ -49,6 +51,8 @@ pub enum MmrError {
     InvalidPeaksCountForElements,
     #[error("cannot batch append an empty list of values")]
     EmptyBatchAppend,
+    #[error("cannot commit precommit: base state changed since precommit was created")]
+    PrecommitBaseStateChanged,
     #[error("no hash found for index {0}")]
     NoHashFoundForIndex(u64),
     #[error("arithmetic overflow")]
