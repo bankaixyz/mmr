@@ -8,8 +8,8 @@ use common::hash_from_hex;
 use common::pg::{PostgresFixture, next_mmr_id};
 use mmr::error::MmrError;
 use mmr::hasher::{Hasher, KeccakHasher, PoseidonHasher};
-use mmr::types::{Hash32, ZERO_HASH};
-use mmr::{KeyKind, Mmr, Store, StoreKey, StoreValue};
+use mmr::types::Hash32;
+use mmr::{KeyKind, Mmr, Store, StoreKey, StoreValue, calculate_root_hash, verify_proof_stateless};
 
 const LEAVES: [&str; 5] = ["1", "2", "3", "4", "5"];
 
@@ -24,30 +24,8 @@ fn lv(value: &str) -> mmr::Hash32 {
     out
 }
 
-fn bag_from_peaks(hasher: &dyn Hasher, peaks_hashes: &[Hash32]) -> Hash32 {
-    match peaks_hashes.len() {
-        0 => ZERO_HASH,
-        1 => peaks_hashes[0],
-        _ => {
-            let mut acc = hasher
-                .hash_pair(
-                    &peaks_hashes[peaks_hashes.len() - 2],
-                    &peaks_hashes[peaks_hashes.len() - 1],
-                )
-                .unwrap();
-
-            for peak_hash in peaks_hashes[..peaks_hashes.len() - 2].iter().rev() {
-                acc = hasher.hash_pair(peak_hash, &acc).unwrap();
-            }
-
-            acc
-        }
-    }
-}
-
 fn root_from_peaks(hasher: &dyn Hasher, peaks_hashes: &[Hash32], elements_count: u64) -> Hash32 {
-    let bag = bag_from_peaks(hasher, peaks_hashes);
-    hasher.hash_count_and_bag(elements_count, &bag).unwrap()
+    calculate_root_hash(hasher, elements_count, peaks_hashes).unwrap()
 }
 
 #[tokio::test]
@@ -410,24 +388,15 @@ async fn postgres_verify_proof_stateful_rejects_tampered_proof_fields() {
     );
 }
 
-#[cfg(feature = "stateless-verify")]
 #[tokio::test]
 async fn postgres_stateless_verify_is_available_and_independent() {
     let fixture = PostgresFixture::start().await;
-    let mut mmr = Mmr::new(
-        fixture.store,
-        Arc::new(KeccakHasher::new()),
-        Some(next_mmr_id()),
-    )
-    .unwrap();
+    let hasher = Arc::new(KeccakHasher::new());
+    let mut mmr = Mmr::new(fixture.store, hasher.clone(), Some(next_mmr_id())).unwrap();
     mmr.append(lv("1")).await.unwrap();
     mmr.append(lv("2")).await.unwrap();
     mmr.append(lv("3")).await.unwrap();
 
     let proof = mmr.get_proof(1, None).await.unwrap();
-    assert!(
-        mmr.verify_proof_stateless(&proof, lv("1"), None)
-            .await
-            .unwrap()
-    );
+    assert!(verify_proof_stateless(hasher.as_ref(), &proof, lv("1")).unwrap());
 }

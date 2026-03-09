@@ -9,7 +9,7 @@
 - Stage batched appends as precommits (`batch_precommit_append`) and either finalize (`commit_precommit`) or discard (`revert_precommit`).
 - Query peaks, bag peaks, and compute root hashes.
 - Generate and verify inclusion proofs.
-- Verify proofs without storage state (`stateless-verify` feature).
+- Verify proofs without storage state using sync stateless helpers.
 
 ## Storage Backends
 
@@ -46,7 +46,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Optional Features
 
 - `postgres-store`: enables PostgreSQL-backed storage.
-- `stateless-verify`: enables `verify_proof_stateless`.
 
 ## Running Tests
 

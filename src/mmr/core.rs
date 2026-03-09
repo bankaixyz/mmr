@@ -10,15 +10,12 @@ use crate::hasher::Hasher;
 #[cfg(feature = "postgres-store")]
 use crate::store::PostgresStore;
 use crate::store::{KeyKind, PendingBatch, Store, StoreKey, StoreValue};
-use crate::types::{
-    AppendResult, BatchAppendResult, ElementIndex, Hash32, MmrId, Proof, ZERO_HASH,
-};
+use crate::types::{AppendResult, BatchAppendResult, ElementIndex, Hash32, MmrId, Proof};
 
 use super::helpers::{
-    element_index_to_leaf_index, elements_count_to_leaf_count, find_peaks, find_siblings,
-    get_peak_info, leaf_count_to_append_no_merges, leaf_count_to_peaks_count,
-    mmr_size_to_leaf_count,
+    elements_count_to_leaf_count, find_peaks, find_siblings, leaf_count_to_append_no_merges,
 };
+use super::stateless::{bag_peaks_hashes, calculate_root_hash, verify_proof_stateless};
 
 static NEXT_MMR_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -73,8 +70,7 @@ impl<S: Store> Mmr<S> {
         }
 
         let leaves_count = elements_count_to_leaf_count(elements_count)?;
-        let bag = mmr.bag_peaks_hashes(&expected_peak_indices, &peaks_hashes)?;
-        let root_hash = mmr.calculate_root_hash(&bag, elements_count)?;
+        let root_hash = calculate_root_hash(mmr.hasher.as_ref(), elements_count, &peaks_hashes)?;
 
         let mut staged_writes = Vec::with_capacity(peaks_hashes.len().saturating_add(3));
         staged_writes.push((mmr.leaf_count_key(), StoreValue::U64(leaves_count)));
@@ -246,13 +242,6 @@ impl<S: Store> Mmr<S> {
             Some(count) => count,
             None => self.get_elements_count().await?,
         };
-        let leaf_count = mmr_size_to_leaf_count(tree_size);
-        let expected_peaks = leaf_count_to_peaks_count(leaf_count) as usize;
-
-        if proof.peaks_hashes.len() != expected_peaks {
-            return Err(MmrError::InvalidPeaksCount);
-        }
-
         if proof.element_index == 0 || proof.element_index > tree_size {
             return Err(MmrError::InvalidElementIndex);
         }
@@ -261,77 +250,12 @@ impl<S: Store> Mmr<S> {
             return Ok(false);
         }
 
-        if proof.element_hash != element_value {
-            return Ok(false);
-        }
-
-        let (peak_index, peak_height) = get_peak_info(tree_size, proof.element_index);
-        if proof.siblings_hashes.len() != peak_height {
-            return Ok(false);
-        }
-
-        let mut hash = element_value;
-        let mut leaf_index = element_index_to_leaf_index(proof.element_index)?;
-
-        for sibling_hash in &proof.siblings_hashes {
-            let is_right = leaf_index % 2 == 1;
-            leaf_index /= 2;
-            hash = if is_right {
-                self.hasher.hash_pair(sibling_hash, &hash)?
-            } else {
-                self.hasher.hash_pair(&hash, sibling_hash)?
-            };
-        }
-
         let peak_hashes = self.retrieve_peaks_hashes(find_peaks(tree_size)).await?;
         if proof.peaks_hashes != peak_hashes {
             return Ok(false);
         }
 
-        Ok(peak_hashes.get(peak_index).copied() == Some(hash))
-    }
-
-    #[cfg(feature = "stateless-verify")]
-    pub async fn verify_proof_stateless(
-        &self,
-        proof: &Proof,
-        element_value: Hash32,
-        elements_count: Option<u64>,
-    ) -> Result<bool, MmrError> {
-        let tree_size = match elements_count {
-            Some(count) => count,
-            None => self.get_elements_count().await?,
-        };
-        let leaf_count = mmr_size_to_leaf_count(tree_size);
-        let expected_peaks = leaf_count_to_peaks_count(leaf_count) as usize;
-
-        if proof.peaks_hashes.len() != expected_peaks {
-            return Err(MmrError::InvalidPeaksCount);
-        }
-
-        if proof.element_index == 0 || proof.element_index > tree_size {
-            return Err(MmrError::InvalidElementIndex);
-        }
-
-        let (peak_index, peak_height) = get_peak_info(tree_size, proof.element_index);
-        if proof.siblings_hashes.len() != peak_height {
-            return Ok(false);
-        }
-
-        let mut hash = element_value;
-        let mut leaf_index = element_index_to_leaf_index(proof.element_index)?;
-
-        for sibling_hash in &proof.siblings_hashes {
-            let is_right = leaf_index % 2 == 1;
-            leaf_index /= 2;
-            hash = if is_right {
-                self.hasher.hash_pair(sibling_hash, &hash)?
-            } else {
-                self.hasher.hash_pair(&hash, sibling_hash)?
-            };
-        }
-
-        Ok(proof.peaks_hashes.get(peak_index).copied() == Some(hash))
+        verify_proof_stateless(self.hasher.as_ref(), proof, element_value)
     }
 
     pub async fn get_peaks(&self, elements_count: Option<u64>) -> Result<Vec<Hash32>, MmrError> {
@@ -349,45 +273,7 @@ impl<S: Store> Mmr<S> {
         };
         let peaks_idxs = find_peaks(tree_size);
         let peaks_hashes = self.retrieve_peaks_hashes(peaks_idxs.clone()).await?;
-        self.bag_peaks_hashes(&peaks_idxs, &peaks_hashes)
-    }
-
-    fn bag_peaks_hashes(
-        &self,
-        peak_indices: &[u64],
-        peak_hashes: &[Hash32],
-    ) -> Result<Hash32, MmrError> {
-        match peak_indices.len() {
-            0 => Ok(ZERO_HASH),
-            1 => peak_hashes
-                .first()
-                .copied()
-                .ok_or(MmrError::NoHashFoundForIndex(peak_indices[0])),
-            _ => {
-                if peak_hashes.len() < 2 {
-                    return Err(MmrError::NoHashFoundForIndex(peak_indices[0]));
-                }
-
-                let mut acc = self.hasher.hash_pair(
-                    &peak_hashes[peak_hashes.len() - 2],
-                    &peak_hashes[peak_hashes.len() - 1],
-                )?;
-
-                for peak in peak_hashes[..peak_hashes.len() - 2].iter().rev() {
-                    acc = self.hasher.hash_pair(peak, &acc)?;
-                }
-
-                Ok(acc)
-            }
-        }
-    }
-
-    pub fn calculate_root_hash(
-        &self,
-        bag: &Hash32,
-        elements_count: u64,
-    ) -> Result<Hash32, MmrError> {
-        Ok(self.hasher.hash_count_and_bag(elements_count, bag)?)
+        bag_peaks_hashes(self.hasher.as_ref(), &peaks_hashes)
     }
 
     pub async fn get_root_hash(&self) -> Result<Option<Hash32>, MmrError> {
@@ -537,8 +423,8 @@ impl<S: Store> Mmr<S> {
         }
 
         let peak_indices = find_peaks(elements_count);
-        let bag = self.bag_peaks_hashes(&peak_indices, &peaks)?;
-        let root_hash = self.calculate_root_hash(&bag, elements_count)?;
+        debug_assert_eq!(peak_indices.len(), peaks.len());
+        let root_hash = calculate_root_hash(self.hasher.as_ref(), elements_count, &peaks)?;
 
         staged_writes.push((self.elements_count_key(), StoreValue::U64(elements_count)));
         staged_writes.push((self.root_hash_key(), StoreValue::Hash(root_hash)));

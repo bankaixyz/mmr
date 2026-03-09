@@ -10,7 +10,10 @@ use mmr::PostgresStore;
 use mmr::error::MmrError;
 use mmr::hasher::{Hasher, KeccakHasher, PoseidonHasher};
 use mmr::types::{Hash32, ZERO_HASH};
-use mmr::{InMemoryStore, KeyKind, Mmr, Store, StoreKey, StoreValue};
+use mmr::{
+    InMemoryStore, KeyKind, Mmr, Store, StoreKey, StoreValue, bag_peaks_hashes,
+    calculate_root_hash, verify_proof_stateless, verify_proof_stateless_with_root,
+};
 
 const LEAVES: [&str; 5] = ["1", "2", "3", "4", "5"];
 
@@ -25,30 +28,8 @@ fn lv(value: &str) -> mmr::Hash32 {
     out
 }
 
-fn bag_from_peaks(hasher: &dyn Hasher, peaks_hashes: &[Hash32]) -> Hash32 {
-    match peaks_hashes.len() {
-        0 => ZERO_HASH,
-        1 => peaks_hashes[0],
-        _ => {
-            let mut acc = hasher
-                .hash_pair(
-                    &peaks_hashes[peaks_hashes.len() - 2],
-                    &peaks_hashes[peaks_hashes.len() - 1],
-                )
-                .unwrap();
-
-            for peak_hash in peaks_hashes[..peaks_hashes.len() - 2].iter().rev() {
-                acc = hasher.hash_pair(peak_hash, &acc).unwrap();
-            }
-
-            acc
-        }
-    }
-}
-
 fn root_from_peaks(hasher: &dyn Hasher, peaks_hashes: &[Hash32], elements_count: u64) -> Hash32 {
-    let bag = bag_from_peaks(hasher, peaks_hashes);
-    hasher.hash_count_and_bag(elements_count, &bag).unwrap()
+    calculate_root_hash(hasher, elements_count, peaks_hashes).unwrap()
 }
 
 #[cfg(feature = "postgres-store")]
@@ -654,7 +635,7 @@ async fn should_handle_create_from_peaks_edge_cases() {
     assert_eq!(zero_bag, ZERO_HASH);
 
     let zero_root = zero_mmr.get_root_hash().await.unwrap().unwrap();
-    let expected_zero_root = zero_mmr.calculate_root_hash(&zero_bag, 0).unwrap();
+    let expected_zero_root = calculate_root_hash(hasher.as_ref(), 0, &[]).unwrap();
     assert_eq!(zero_root, expected_zero_root);
 
     let zero_append = zero_mmr.append(lv("1000")).await.unwrap();
@@ -662,6 +643,7 @@ async fn should_handle_create_from_peaks_edge_cases() {
     assert_eq!(zero_append.leaves_count, 1);
 
     let single = lv("0x1001");
+    let one_hasher = hasher.clone();
     let mut one_mmr = Mmr::create_from_peaks(
         Arc::new(InMemoryStore::default()),
         hasher,
@@ -678,7 +660,7 @@ async fn should_handle_create_from_peaks_edge_cases() {
     assert_eq!(one_mmr.bag_the_peaks(None).await.unwrap(), single);
 
     let one_root = one_mmr.get_root_hash().await.unwrap().unwrap();
-    let expected_one_root = one_mmr.calculate_root_hash(&single, 1).unwrap();
+    let expected_one_root = calculate_root_hash(one_hasher.as_ref(), 1, &[single]).unwrap();
     assert_eq!(one_root, expected_one_root);
 
     let one_append = one_mmr.append(lv("2000")).await.unwrap();
@@ -823,34 +805,87 @@ async fn verify_proof_stateful_rejects_tampered_proof_fields() {
     );
 }
 
-#[cfg(feature = "stateless-verify")]
+#[test]
+fn stateless_helpers_cover_peak_bagging_edges() {
+    let hasher = KeccakHasher::new();
+    let empty: Vec<Hash32> = vec![];
+    let single = lv("1");
+    let multi = vec![lv("1"), lv("2"), lv("3")];
+
+    assert_eq!(bag_peaks_hashes(&hasher, &empty).unwrap(), ZERO_HASH);
+    assert_eq!(bag_peaks_hashes(&hasher, &[single]).unwrap(), single);
+
+    let expected_multi = hasher
+        .hash_pair(&multi[0], &hasher.hash_pair(&multi[1], &multi[2]).unwrap())
+        .unwrap();
+    assert_eq!(bag_peaks_hashes(&hasher, &multi).unwrap(), expected_multi);
+    assert!(matches!(
+        calculate_root_hash(&hasher, 1, &multi),
+        Err(MmrError::InvalidPeaksCountForElements)
+    ));
+}
+
 #[tokio::test]
 async fn stateless_verify_is_available_and_independent() {
     let store = Arc::new(InMemoryStore::default());
     let hasher = Arc::new(KeccakHasher::new());
 
-    let mut mmr = Mmr::new(store, hasher, Some(51)).unwrap();
+    let mut mmr = Mmr::new(store, hasher.clone(), Some(51)).unwrap();
     mmr.append(lv("1")).await.unwrap();
     mmr.append(lv("2")).await.unwrap();
     mmr.append(lv("3")).await.unwrap();
 
     let proof = mmr.get_proof(1, None).await.unwrap();
-    assert!(
-        mmr.verify_proof_stateless(&proof, lv("1"), None)
-            .await
-            .unwrap()
-    );
+    let root = mmr.get_root_hash().await.unwrap().unwrap();
+    assert!(verify_proof_stateless(hasher.as_ref(), &proof, lv("1")).unwrap());
+    assert!(verify_proof_stateless_with_root(hasher.as_ref(), &proof, lv("1"), &root).unwrap());
 
     let mut tampered = proof.clone();
     tampered.peaks_hashes[0] = [0u8; 32];
 
+    assert!(!verify_proof_stateless(hasher.as_ref(), &tampered, lv("1")).unwrap());
     assert!(
-        !mmr.verify_proof_stateless(&tampered, lv("1"), None)
-            .await
-            .unwrap()
+        !verify_proof_stateless_with_root(hasher.as_ref(), &proof, lv("1"), &[9u8; 32]).unwrap()
     );
 
     assert!(!mmr.verify_proof(&tampered, lv("1"), None).await.unwrap());
+}
+
+#[tokio::test]
+async fn stateless_verify_rejects_invalid_inputs_and_detects_tampering() {
+    let store = Arc::new(InMemoryStore::default());
+    let hasher = Arc::new(KeccakHasher::new());
+
+    let mut mmr = Mmr::new(store, hasher.clone(), Some(52)).unwrap();
+    mmr.append(lv("1")).await.unwrap();
+    mmr.append(lv("2")).await.unwrap();
+    mmr.append(lv("3")).await.unwrap();
+
+    let proof = mmr.get_proof(1, None).await.unwrap();
+
+    assert!(!verify_proof_stateless(hasher.as_ref(), &proof, lv("9")).unwrap());
+
+    let mut tampered_siblings = proof.clone();
+    tampered_siblings.siblings_hashes.clear();
+    assert!(!verify_proof_stateless(hasher.as_ref(), &tampered_siblings, lv("1")).unwrap());
+
+    let mut tampered_element_hash = proof.clone();
+    tampered_element_hash.element_hash = lv("99");
+    assert!(!verify_proof_stateless(hasher.as_ref(), &tampered_element_hash, lv("1")).unwrap());
+
+    let mut invalid_peaks = proof.clone();
+    invalid_peaks.peaks_hashes.clear();
+    assert!(matches!(
+        verify_proof_stateless(hasher.as_ref(), &invalid_peaks, lv("1")),
+        Err(MmrError::InvalidPeaksCount)
+    ));
+
+    let mut invalid_index = proof.clone();
+    invalid_index.element_index = 0;
+    assert!(matches!(
+        verify_proof_stateless(hasher.as_ref(), &invalid_index, lv("1")),
+        Err(MmrError::InvalidElementIndex)
+    ));
 }
 
 #[cfg(feature = "postgres-store")]

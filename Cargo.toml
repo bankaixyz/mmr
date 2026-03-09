@@ -6,7 +6,6 @@ description = "Minimal async MMR core with typed storage and Keccak/Poseidon has
 
 [features]
 default = []
-stateless-verify = []
 postgres-store = ["dep:sqlx"]
 
 [dependencies]
