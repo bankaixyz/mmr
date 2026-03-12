@@ -96,7 +96,10 @@ impl fmt::Display for HasherError {
                 write!(f, "input `{value}` exceeds max byte length {max_bytes}")
             }
             Self::InvalidFieldElement { value } => {
-                write!(f, "value `{value}` cannot be represented as a Starknet field element")
+                write!(
+                    f,
+                    "value `{value}` cannot be represented as a Starknet field element"
+                )
             }
         }
     }
@@ -145,7 +148,10 @@ impl fmt::Display for MmrError {
                 "cannot append while a precommit batch is pending; commit or revert first"
             ),
             Self::PrecommitBaseStateChanged => {
-                write!(f, "precommit base state changed; retry from current committed state")
+                write!(
+                    f,
+                    "precommit base state changed; retry from current committed state"
+                )
             }
             Self::NoHashFoundForIndex(index) => write!(f, "no hash found for index {index}"),
             Self::Overflow => write!(f, "arithmetic overflow"),
