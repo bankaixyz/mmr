@@ -1,10 +1,12 @@
 mod keccak;
+#[cfg(feature = "poseidon")]
 mod poseidon;
 
 use crate::error::HasherError;
 use crate::types::Hash32;
 
 pub use keccak::KeccakHasher;
+#[cfg(feature = "poseidon")]
 pub use poseidon::PoseidonHasher;
 
 pub trait Hasher: Send + Sync {

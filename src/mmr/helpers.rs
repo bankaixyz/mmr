@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use crate::error::MmrError;
 
 pub fn find_peaks(elements_count: u64) -> Vec<u64> {

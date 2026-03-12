@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 pub type Hash32 = [u8; 32];
 pub type MmrId = u32;
 pub type ElementIndex = u64;

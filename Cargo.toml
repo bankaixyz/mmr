@@ -5,15 +5,15 @@ edition = "2024"
 description = "Minimal async MMR core with typed storage and Keccak/Poseidon hashers"
 
 [features]
-default = []
-postgres-store = ["dep:sqlx"]
+default = ["std"]
+std = []
+poseidon = ["dep:starknet-crypto"]
+postgres-store = ["std", "dep:sqlx"]
 
 [dependencies]
-thiserror = "1.0"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
-hex = "0.4"
-starknet = "0.6.0"
-starknet-crypto = "0.6.0"
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+starknet-crypto = { version = "0.6.0", default-features = false, optional = true }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres"], optional = true }
 
 [dev-dependencies]

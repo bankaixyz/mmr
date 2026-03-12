@@ -1,7 +1,7 @@
-use std::str::FromStr;
+use alloc::format;
+use core::str::FromStr;
 
-use starknet::core::types::FieldElement;
-use starknet_crypto::{poseidon_hash, poseidon_hash_single};
+use starknet_crypto::{FieldElement, poseidon_hash, poseidon_hash_single};
 
 use crate::error::HasherError;
 use crate::types::{Hash32, ZERO_HASH};

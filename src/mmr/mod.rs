@@ -1,7 +1,9 @@
+#[cfg(feature = "std")]
 mod core;
 mod helpers;
 pub mod stateless;
 
+#[cfg(feature = "std")]
 pub use core::Mmr;
 pub use helpers::{
     element_index_to_leaf_index, elements_count_to_leaf_count, find_peaks, find_siblings,
